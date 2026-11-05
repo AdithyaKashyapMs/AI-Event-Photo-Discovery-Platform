@@ -11,7 +11,6 @@ onnxruntime
 qdrant-client
 python-jose[cryptography]
 bcrypt<5
-passlib
 python-multipart
 boto3
 qrcode[pil]

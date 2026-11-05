@@ -9,12 +9,14 @@ import imagehash
 from PIL import Image
 import numpy as np
 import cv2
+import warnings
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Distance, VectorParams
 from sqlmodel import Session, select
 
 from app.database import engine
 from app.models import Photo, FaceRecord
+from app.hierarchy import rebuild_event_hierarchy
 
 # Initialize Celery app with Redis broker
 celery_app = Celery('tasks', broker='redis://localhost:6379/0')
@@ -61,7 +63,14 @@ def process_photo(photo_id: int):
 
             # 2. Detect faces with InsightFace buffalo_l
             face_analyzer = get_face_app()
-            faces = face_analyzer.get(img)
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore',
+                    message='`estimate` is deprecated since version 0.26.*',
+                    category=FutureWarning,
+                    module=r'insightface\.utils\.face_align',
+                )
+                faces = face_analyzer.get(img)
 
             # 5. Check duplicate via perceptual hash
             # Calculates an image signature to prevent redundant processing
@@ -129,6 +138,7 @@ def process_photo(photo_id: int):
             photo.status = 'done'
             session.add(photo)
             session.commit()
+            rebuild_event_hierarchy(qdrant_client, photo.event_id)
 
             return f"Processed photo {photo_id} successfully. Found {len(faces)} faces."
 

@@ -5,6 +5,7 @@ from app.models import Event, Photo, User, UserRole, FaceRecord, EventMembership
 from app.database import get_session
 from app.deps import get_current_user, require_host
 from app.tasks import process_photo
+from app.hierarchy import hierarchical_query
 from typing import Optional
 from insightface.app import FaceAnalysis
 from qdrant_client import QdrantClient
@@ -16,6 +17,8 @@ import numpy as np
 import cv2
 import io
 import zipfile
+import warnings
+from time import perf_counter
 
 
 router = APIRouter()
@@ -209,7 +212,14 @@ def match_selfie(
     # Detect face and generate embedding using InsightFace
     face_app = FaceAnalysis(providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(640, 640))
-    faces = face_app.get(img)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='`estimate` is deprecated since version 0.26.*',
+            category=FutureWarning,
+            module=r'insightface\.utils\.face_align',
+        )
+        faces = face_app.get(img)
 
     if not faces:
         raise HTTPException(status_code=400, detail="No face detected in selfie")
@@ -222,13 +232,16 @@ def match_selfie(
     collection_name = f"event_{event_id}_faces"
     client = QdrantClient(host="localhost", port=6333)
 
-    results = client.query_points(
-        collection_name=collection_name,
-        query=query_embedding,
-        score_threshold=0.4,
-        limit=100,
-        with_payload=True,
-    ).points
+    search_started = perf_counter()
+    results, search_stats = hierarchical_query(
+        client, collection_name, query_embedding, limit=100
+    )
+    search_stats["latency_ms"] = round((perf_counter() - search_started) * 1000, 2)
+    indexed_faces = search_stats["indexed_faces"]
+    faces_considered = search_stats["faces_considered"]
+    search_stats["reduction_percent"] = round(
+        (1 - faces_considered / indexed_faces) * 100, 1
+    ) if indexed_faces else 0
 
     # Deduplicate by photo_id and collect confidence scores
     seen_photos = {}
@@ -241,7 +254,7 @@ def match_selfie(
         {"photo_id": pid, "confidence": score} for pid, score in seen_photos.items()
     ]
 
-    return {"matches": matches, "total": len(matches)}
+    return {"matches": matches, "total": len(matches), "search": search_stats}
 
 
 # --- Gallery Endpoints ---
@@ -474,6 +487,22 @@ async def get_event_analytics(event_id: int, session: Session = Depends(get_sess
         'low_quality_faces': len([q for q in quality_scores if q < 0.5])
     }
 
+    hierarchy = {"branches": 0, "indexed_faces": faces_detected}
+    collection_name = f"event_{event_id}_faces"
+    if client.collection_exists(collection_name):
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            limit=10000,
+            with_payload=True,
+            with_vectors=False,
+        )
+        codes = {
+            point.payload.get("identity_code")
+            for point in points
+            if point.payload and point.payload.get("identity_code")
+        }
+        hierarchy = {"branches": len(codes), "indexed_faces": len(points)}
+
     return {
         'total_photos': total_photos,
         'faces_detected': faces_detected,
@@ -485,4 +514,6 @@ async def get_event_analytics(event_id: int, session: Session = Depends(get_sess
             'duplicate_embeddings': duplicate_count
         },
         'quality_summary': quality_summary
+        ,
+        'hierarchy': hierarchy,
     }
