@@ -6,9 +6,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 
-BRANCHING_FACTOR = 4
-MAX_DEPTH = 3
 MAX_CANDIDATE_BRANCHES = 3
+MIN_FACE_SIMILARITY = 0.55
+_hierarchy_cache: dict[str, tuple[int, list[Any], dict[str, list[Any]], int, int]] = {}
 
 
 def _normalize(vectors: np.ndarray) -> np.ndarray:
@@ -33,17 +33,27 @@ def _kmeans(vectors: np.ndarray, k: int) -> np.ndarray:
     return assignments
 
 
+def _hierarchy_config(vector_count: int) -> tuple[int, int]:
+    if vector_count < 32:
+        return 2, 2
+    if vector_count < 256:
+        return 4, 3
+    return 8, 4
+
+
 def _build_codes(
     vectors: np.ndarray,
     indices: np.ndarray,
+    branching_factor: int,
+    max_depth: int,
     prefix: tuple[int, ...] = (),
     depth: int = 0,
 ) -> dict[int, str]:
-    if len(indices) <= 1 or depth >= MAX_DEPTH:
+    if len(indices) <= 1 or depth >= max_depth:
         code = "-".join(map(str, prefix)) or "0"
         return {int(index): code for index in indices}
 
-    k = min(BRANCHING_FACTOR, len(indices))
+    k = min(branching_factor, len(indices))
     assignments = _kmeans(vectors[indices], k)
     codes: dict[int, str] = {}
     for cluster_index in range(k):
@@ -53,6 +63,8 @@ def _build_codes(
                 _build_codes(
                     vectors,
                     members,
+                    branching_factor,
+                    max_depth,
                     (*prefix, cluster_index),
                     depth + 1,
                 )
@@ -62,6 +74,7 @@ def _build_codes(
 
 def rebuild_event_hierarchy(client: QdrantClient, event_id: int) -> dict[str, int]:
     collection_name = f"event_{event_id}_faces"
+    _hierarchy_cache.pop(collection_name, None)
     if not client.collection_exists(collection_name):
         return {"indexed_faces": 0, "branches": 0}
 
@@ -75,7 +88,13 @@ def rebuild_event_hierarchy(client: QdrantClient, event_id: int) -> dict[str, in
         return {"indexed_faces": 0, "branches": 0}
 
     vectors = _normalize(np.asarray([point.vector for point in points], dtype=float))
-    codes = _build_codes(vectors, np.arange(len(points)))
+    branching_factor, max_depth = _hierarchy_config(len(points))
+    codes = _build_codes(
+        vectors,
+        np.arange(len(points)),
+        branching_factor,
+        max_depth,
+    )
     points_by_code: dict[str, list[str]] = defaultdict(list)
     for index, code in codes.items():
         points_by_code[code].append(str(points[index].id))
@@ -88,7 +107,12 @@ def rebuild_event_hierarchy(client: QdrantClient, event_id: int) -> dict[str, in
             wait=True,
         )
 
-    return {"indexed_faces": len(points), "branches": len(points_by_code)}
+    return {
+        "indexed_faces": len(points),
+        "branches": len(points_by_code),
+        "branching_factor": branching_factor,
+        "max_depth": max_depth,
+    }
 
 
 def hierarchical_query(
@@ -96,24 +120,41 @@ def hierarchical_query(
     collection_name: str,
     query_embedding: list[float],
     limit: int = 100,
+    use_cache: bool = False,
 ) -> tuple[list[Any], dict[str, int]]:
-    points, _ = client.scroll(
-        collection_name=collection_name,
-        limit=10000,
-        with_payload=True,
-        with_vectors=True,
-    )
-    branches: dict[str, list[Any]] = defaultdict(list)
-    for point in points:
-        code = point.payload.get("identity_code") if point.payload else None
-        if code:
-            branches[code].append(point)
+    cached = _hierarchy_cache.get(collection_name) if use_cache else None
+    if cached is not None:
+        if client.get_collection(collection_name).points_count != cached[0]:
+            cached = None
+    if cached is None:
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            limit=10000,
+            with_payload=True,
+            with_vectors=True,
+        )
+        branching_factor, max_depth = _hierarchy_config(len(points))
+        branches: dict[str, list[Any]] = defaultdict(list)
+        for point in points:
+            code = point.payload.get("identity_code") if point.payload else None
+            if code:
+                branches[code].append(point)
+        if use_cache:
+            _hierarchy_cache[collection_name] = (
+                len(points),
+                points,
+                dict(branches),
+                branching_factor,
+                max_depth,
+            )
+    else:
+        _, points, branches, branching_factor, max_depth = cached
 
     if not branches:
         results = client.query_points(
             collection_name=collection_name,
             query=query_embedding,
-            score_threshold=0.4,
+            score_threshold=MIN_FACE_SIMILARITY,
             limit=limit,
             with_payload=True,
         ).points
@@ -121,6 +162,8 @@ def hierarchical_query(
             "branches_considered": 0,
             "faces_considered": len(points),
             "indexed_faces": len(points),
+            "branching_factor": branching_factor,
+            "max_depth": max_depth,
         }
 
     query = _normalize(np.asarray([query_embedding], dtype=float))[0]
@@ -153,7 +196,7 @@ def hierarchical_query(
                         )
                     ]
                 ),
-                score_threshold=0.4,
+                score_threshold=MIN_FACE_SIMILARITY,
                 limit=limit,
                 with_payload=True,
             ).points
@@ -163,4 +206,6 @@ def hierarchical_query(
         "branches_considered": len(selected_codes),
         "faces_considered": sum(len(branches[code]) for code in selected_codes),
         "indexed_faces": len(points),
+        "branching_factor": branching_factor,
+        "max_depth": max_depth,
     }

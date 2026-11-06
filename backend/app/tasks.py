@@ -20,6 +20,13 @@ from app.hierarchy import rebuild_event_hierarchy
 
 # Initialize Celery app with Redis broker
 celery_app = Celery('tasks', broker='redis://localhost:6379/0')
+celery_app.conf.update(
+    # Prefork currently fails on macOS with this Python/billiard combination
+    # before the task handler starts. Use solo locally; production can override it.
+    worker_pool=os.getenv("CELERY_WORKER_POOL", "solo"),
+    worker_concurrency=1,
+    task_track_started=True,
+)
 
 # Lazy-loaded face analysis pipeline to prevent workers from locking up on load
 _face_app = None
@@ -119,6 +126,7 @@ def process_photo(photo_id: int):
                                 "photo_id": photo_id,
                                 "event_id": photo.event_id,
                                 "face_index": idx
+                                ,"quality_score": float(quality_score)
                             }
                         )
                     ]

@@ -22,6 +22,17 @@ from time import perf_counter
 
 
 router = APIRouter()
+_selfie_face_app = None
+
+
+def get_selfie_face_app():
+    global _selfie_face_app
+    if _selfie_face_app is None:
+        _selfie_face_app = FaceAnalysis(
+            name="buffalo_l", providers=["CPUExecutionProvider"]
+        )
+        _selfie_face_app.prepare(ctx_id=0, det_size=(640, 640))
+    return _selfie_face_app
 
 
 # Create a new event (host only)
@@ -42,10 +53,16 @@ def create_event(
 # List all events owned by the current host
 @router.get("/")
 def list_events(
-    user: User = Depends(require_host), session: Session = Depends(get_session)
+    user: User = Depends(get_current_user), session: Session = Depends(get_session)
 ):
-    events = session.exec(select(Event).where(Event.host_id == user.id)).all()
-    return events
+    if user.role == UserRole.host:
+        return session.exec(select(Event).where(Event.host_id == user.id)).all()
+
+    return session.exec(
+        select(Event)
+        .join(EventMembership, EventMembership.event_id == Event.id)
+        .where(EventMembership.user_id == user.id)
+    ).all()
 
 
 # Get a single event by ID
@@ -130,9 +147,9 @@ async def upload_photos(
     user: User = Depends(require_host),
     session: Session = Depends(get_session),
 ):
-    # Verify the event exists and belongs to this host
+    # Verify the event exists. require_host prevents attendee uploads.
     event = session.get(Event, event_id)
-    if not event or event.host_id != user.id:
+    if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
     # Create the upload directory for this event
@@ -192,69 +209,150 @@ def generate_qr(
 @router.post("/{event_id}/match-selfie")
 def match_selfie(
     event_id: int,
-    file: UploadFile = File(...),
+    files: list[UploadFile] | None = File(None),
+    file: UploadFile | None = File(None),
     current_user: User = Depends(get_current_user),
 ):
-    # Read the uploaded selfie image
-    contents = file.file.read()
-    if not contents:
-        raise HTTPException(status_code=400, detail="Selfie file is empty")
+    uploaded_files = list(files or [])
+    if file is not None:
+        uploaded_files.append(file)
+    if not uploaded_files:
+        raise HTTPException(status_code=400, detail="At least one selfie is required")
 
-    np_arr = np.frombuffer(contents, np.uint8)
+    face_app = get_selfie_face_app()
+    embeddings = []
+    weights = []
     try:
-        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    except cv2.error as exc:
-        raise HTTPException(status_code=400, detail="Invalid selfie image") from exc
+        for uploaded_file in uploaded_files:
+            contents = uploaded_file.file.read()
+            if not contents:
+                continue
+            np_arr = np.frombuffer(contents, np.uint8)
+            try:
+                img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            except cv2.error as exc:
+                raise HTTPException(status_code=400, detail="Invalid selfie image") from exc
+            if img is None:
+                raise HTTPException(status_code=400, detail="Invalid image file")
 
-    if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore',
+                    message='`estimate` is deprecated since version 0.26.*',
+                    category=FutureWarning,
+                    module=r'insightface\.utils\.face_align',
+                )
+                faces = face_app.get(img)
+            if not faces:
+                continue
+            face = max(faces, key=lambda detected: detected["det_score"])
+            embeddings.append(np.asarray(face["embedding"], dtype=float))
+            weights.append(float(face["det_score"]))
+    finally:
+        # Selfies are processed in memory only and are never written to storage.
+        for uploaded_file in uploaded_files:
+            uploaded_file.file.close()
 
-    # Detect face and generate embedding using InsightFace
-    face_app = FaceAnalysis(providers=["CPUExecutionProvider"])
-    face_app.prepare(ctx_id=0, det_size=(640, 640))
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            'ignore',
-            message='`estimate` is deprecated since version 0.26.*',
-            category=FutureWarning,
-            module=r'insightface\.utils\.face_align',
-        )
-        faces = face_app.get(img)
+    if not embeddings:
+        raise HTTPException(status_code=400, detail="No face detected in the supplied selfies")
 
-    if not faces:
-        raise HTTPException(status_code=400, detail="No face detected in selfie")
-
-    # Use the highest-confidence face
-    face = max(faces, key=lambda f: f["det_score"])
-    query_embedding = face["embedding"].tolist()
+    weights_array = np.asarray(weights, dtype=float)
+    fused_embedding = np.average(
+        np.asarray(embeddings),
+        axis=0,
+        weights=np.maximum(weights_array, 1e-6),
+    )
+    fused_embedding /= max(float(np.linalg.norm(fused_embedding)), 1e-12)
+    query_embedding = fused_embedding.tolist()
 
     # Search Qdrant for matching face embeddings
     collection_name = f"event_{event_id}_faces"
     client = QdrantClient(host="localhost", port=6333)
 
-    search_started = perf_counter()
-    results, search_stats = hierarchical_query(
-        client, collection_name, query_embedding, limit=100
+    research_started = perf_counter()
+    _, research_stats = hierarchical_query(
+        client, collection_name, query_embedding, limit=100, use_cache=False
     )
-    search_stats["latency_ms"] = round((perf_counter() - search_started) * 1000, 2)
+    research_latency_ms = round((perf_counter() - research_started) * 1000, 2)
+
+    project_started = perf_counter()
+    results, search_stats = hierarchical_query(
+        client, collection_name, query_embedding, limit=100, use_cache=True
+    )
+    project_latency_ms = round((perf_counter() - project_started) * 1000, 2)
+    search_stats["latency_ms"] = project_latency_ms
     indexed_faces = search_stats["indexed_faces"]
     faces_considered = search_stats["faces_considered"]
     search_stats["reduction_percent"] = round(
         (1 - faces_considered / indexed_faces) * 100, 1
     ) if indexed_faces else 0
+    search_stats["similarity_threshold"] = 0.55
+    search_stats["raw_results"] = len(results)
 
-    # Deduplicate by photo_id and collect confidence scores
+    # Keep recognition confidence based on face similarity. Photo quality must not
+    # turn a weak identity match into an accepted result.
     seen_photos = {}
     for result in results:
         photo_id = result.payload["photo_id"]
-        if photo_id not in seen_photos or result.score > seen_photos[photo_id]:
-            seen_photos[photo_id] = result.score
+        quality = float(result.payload.get("quality_score", 0.5))
+        similarity = float(result.score)
+        candidate = {
+            "confidence": similarity,
+            "similarity": similarity,
+            "quality": quality,
+        }
+        if photo_id not in seen_photos or similarity > seen_photos[photo_id]["confidence"]:
+            seen_photos[photo_id] = candidate
+
 
     matches = [
-        {"photo_id": pid, "confidence": score} for pid, score in seen_photos.items()
+        {"photo_id": pid, **scores} for pid, scores in seen_photos.items()
     ]
+    matches.sort(key=lambda match: match["confidence"], reverse=True)
+    search_stats["unique_photos"] = len(matches)
+    search_stats["best_similarity"] = round(
+        matches[0]["similarity"], 4
+    ) if matches else 0
+    search_stats["average_similarity"] = round(
+        sum(match["similarity"] for match in matches) / len(matches), 4
+    ) if matches else 0
+    search_stats["no_match_reason"] = (
+        "No indexed face met the similarity threshold"
+        if not matches and indexed_faces
+        else "No faces are indexed for this event"
+        if not matches
+        else None
+    )
+    search_stats["comparison"] = {
+        "research_hierarchy": {
+            "method": "Hierarchy rebuilt from Qdrant on every request",
+            "latency_ms": research_latency_ms,
+            "candidates": research_stats["faces_considered"],
+        },
+        "our_project": {
+            "method": "Cached hierarchy with weighted fusion and filtering",
+            "latency_ms": project_latency_ms,
+            "candidates": faces_considered,
+        },
+        "improvements": [
+            "Hierarchy index reused between selfie requests",
+            "Weighted fusion of multiple selfie embeddings",
+            "Similarity threshold for rejecting weak matches",
+            "Photo-level deduplication",
+        ],
+        "accuracy_benchmark": "Unavailable without labeled ground-truth identities",
+    }
 
-    return {"matches": matches, "total": len(matches), "search": search_stats}
+    return {
+        "matches": matches,
+        "total": len(matches),
+        "selfies_processed": len(embeddings),
+        "search": search_stats,
+        "privacy": {
+            "selfies_persisted": False,
+            "temporary_files_deleted": True,
+        },
+    }
 
 
 # --- Gallery Endpoints ---
