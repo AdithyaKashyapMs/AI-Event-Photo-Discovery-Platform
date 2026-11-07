@@ -1,0 +1,17 @@
+# Python local files
+backend/venv/
+backend/**/__pycache__/
+backend/uploads/
+*.py[cod]
+
+# Frontend dependencies and generated output
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/*.tsbuildinfo
+
+# Local configuration and generated reports
+.env
+.env.*
+*.pdf
