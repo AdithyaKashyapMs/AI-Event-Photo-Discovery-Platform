@@ -17,15 +17,19 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
 @router.post('/register')
 def register(req: RegisterRequest, session: Session = Depends(get_session)):
+    email = normalize_email(req.email)
     # Check if email already exists
-    existing = session.exec(select(User).where(User.email == req.email)).first()
+    existing = session.exec(select(User).where(User.email == email)).first()
     if existing:
         raise HTTPException(status_code=400, detail='Email already registered')
     # Create new user with hashed password
     user = User(
-        email=req.email,
+        email=email,
         hashed_password=hash_password(req.password),
         role=req.role
     )
@@ -38,8 +42,9 @@ def register(req: RegisterRequest, session: Session = Depends(get_session)):
 
 @router.post('/login')
 def login(req: LoginRequest, session: Session = Depends(get_session)):
+    email = normalize_email(req.email)
     # Find user by email
-    user = session.exec(select(User).where(User.email == req.email)).first()
+    user = session.exec(select(User).where(User.email == email)).first()
     if not user or not verify_password(req.password, user.hashed_password):
         raise HTTPException(status_code=401, detail='Invalid credentials')
     # Return access token

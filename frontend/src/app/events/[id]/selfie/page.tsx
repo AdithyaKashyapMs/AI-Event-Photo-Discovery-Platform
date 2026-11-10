@@ -4,6 +4,23 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { API_BASE } from '@/lib/api'
 
+type SelfieMode = 'single' | 'multi'
+
+const ANGLE_GUIDE = [
+  {
+    name: 'Front view',
+    instruction: 'Look straight at the camera with your face fully visible.',
+  },
+  {
+    name: 'Right-side view',
+    instruction: 'Turn your face slightly to your right. Keep one eye and most of your face visible.',
+  },
+  {
+    name: 'Left-side view',
+    instruction: 'Turn your face slightly to your left. Keep one eye and most of your face visible.',
+  },
+] as const
+
 // Selfie capture page with camera access and file upload fallback
 export default function SelfiePage() {
   const params = useParams<{ id: string }>()
@@ -18,6 +35,7 @@ export default function SelfiePage() {
   const [cameraActive, setCameraActive] = useState(false)
   const [cameraStarting, setCameraStarting] = useState(false)
   const [capturedImages, setCapturedImages] = useState<string[]>([])
+  const [selfieMode, setSelfieMode] = useState<SelfieMode>('single')
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState('')
   const [cameraError, setCameraError] = useState(false)
@@ -89,24 +107,37 @@ export default function SelfiePage() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
       const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
       if (dataUrl.length > 'data:image/jpeg;base64,'.length) {
-        setCapturedImages([dataUrl])
+        setCapturedImages((images) =>
+          selfieMode === 'single' ? [dataUrl] : [...images, dataUrl],
+        )
       } else {
         setError('Could not capture an image. Please try again.')
       }
     }
 
-    // Stop the camera stream after capture
+    // Keep the camera open for additional angles, then stop after the third.
+    if (selfieMode === 'single' || capturedImages.length >= 2) {
+      stopCamera()
+    }
+  }
+
+  const currentAngle = ANGLE_GUIDE[capturedImages.length]
+
+  const stopCamera = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop())
       streamRef.current = null
-      video.srcObject = null
+      if (videoRef.current) videoRef.current.srcObject = null
       setCameraActive(false)
     }
   }
 
   // Handle file upload as fallback
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || [])
+    const files = Array.from(e.target.files || []).slice(
+      0,
+      selfieMode === 'multi' ? 3 : 1,
+    )
     if (!files.length) return
     Promise.all(files.map((file) => new Promise<string>((resolve, reject) => {
       const reader = new FileReader()
@@ -114,6 +145,7 @@ export default function SelfiePage() {
       reader.onerror = reject
       reader.readAsDataURL(file)
     }))).then(setCapturedImages).catch(() => setError('Could not read the selected selfies.'))
+    e.target.value = ''
   }
 
   // Convert base64 data URL to a File object for upload
@@ -132,8 +164,13 @@ export default function SelfiePage() {
   // Submit the selfie to the match endpoint
   const submitSelfie = async () => {
     if (!capturedImages.length) return
+    if (selfieMode === 'multi' && capturedImages.length < 2) {
+      setError('Capture or select at least two selfies from different angles.')
+      return
+    }
     setUploading(true)
     setError('')
+    stopCamera()
 
     try {
       const files = capturedImages.map((image, index) =>
@@ -183,6 +220,8 @@ export default function SelfiePage() {
         unique: String(data.search?.unique_photos || 0),
         best: String(data.search?.best_similarity || 0),
         average: String(data.search?.average_similarity || 0),
+        fusionAgreement: String(data.search?.fusion_agreement || 0),
+        fusionMethod: String(data.search?.fusion_method || ''),
         noMatchReason: String(data.search?.no_match_reason || ''),
         researchLatency: String(data.search?.comparison?.research_hierarchy?.latency_ms || 0),
         researchCandidates: String(data.search?.comparison?.research_hierarchy?.candidates || 0),
@@ -202,9 +241,21 @@ export default function SelfiePage() {
 
   // Reset to retake the selfie
   const retake = () => {
+    stopCamera()
     setCapturedImages([])
+    setError('')
     if (!cameraError) {
-      startCamera()
+      window.setTimeout(() => void startCamera(), 0)
+    }
+  }
+
+  const selectMode = (mode: SelfieMode) => {
+    stopCamera()
+    setSelfieMode(mode)
+    setCapturedImages([])
+    setError('')
+    if (!cameraError) {
+      window.setTimeout(() => void startCamera(), 0)
     }
   }
 
@@ -216,6 +267,33 @@ export default function SelfiePage() {
           Take a selfie or upload a photo so we can find you in event photos.
         </p>
 
+        <div className="mb-6 grid grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={() => selectMode('single')}
+            className={`rounded-lg border p-3 text-left ${
+              selfieMode === 'single'
+                ? 'border-blue-600 bg-blue-50 text-blue-900'
+                : 'border-gray-300 text-gray-700'
+            }`}
+          >
+            <span className="block font-semibold">One selfie</span>
+            <span className="mt-1 block text-xs">Fast search with one face view</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => selectMode('multi')}
+            className={`rounded-lg border p-3 text-left ${
+              selfieMode === 'multi'
+                ? 'border-blue-600 bg-blue-50 text-blue-900'
+                : 'border-gray-300 text-gray-700'
+            }`}
+          >
+            <span className="block font-semibold">Multiple angles</span>
+            <span className="mt-1 block text-xs">Use 2–3 views for better matching</span>
+          </button>
+        </div>
+
         {error && (
           <div className="bg-red-50 text-red-700 p-3 rounded mb-4 text-sm">
             {error}
@@ -223,7 +301,7 @@ export default function SelfiePage() {
         )}
 
         {/* Camera preview or captured image */}
-        {!capturedImages.length ? (
+        {!capturedImages.length || selfieMode === 'multi' ? (
           <div className="space-y-4">
             <div className={`relative ${cameraActive ? '' : 'hidden'}`}>
               <video
@@ -234,13 +312,38 @@ export default function SelfiePage() {
                 className="w-full rounded-lg bg-black"
               />
               {cameraActive && (
-                <button
-                  onClick={capturePhoto}
-                  className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white rounded-full w-16 h-16 border-4 border-blue-600 hover:border-blue-700"
-                  aria-label="Capture photo"
-                />
+                <>
+                  <button
+                    onClick={capturePhoto}
+                    disabled={selfieMode === 'multi' && capturedImages.length >= 3}
+                    className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white rounded-full w-16 h-16 border-4 border-blue-600 hover:border-blue-700 disabled:opacity-50"
+                    aria-label="Capture photo"
+                  />
+                  {selfieMode === 'multi' && capturedImages.length > 0 && (
+                    <span className="absolute top-3 left-3 rounded bg-black/70 px-2 py-1 text-xs text-white">
+                      {capturedImages.length}/3 angles captured
+                    </span>
+                  )}
+                </>
               )}
             </div>
+
+            {capturedImages.length > 0 && (
+              <div className="grid grid-cols-3 gap-2">
+                {capturedImages.map((image, index) => (
+                  <img key={image} src={image} alt={`Selfie angle ${index + 1}`} className="w-full rounded-lg" />
+                ))}
+              </div>
+            )}
+
+            {selfieMode === 'multi' && currentAngle && (
+              <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
+                <p className="font-semibold">
+                  Next: {currentAngle.name}
+                </p>
+                <p className="mt-1">{currentAngle.instruction}</p>
+              </div>
+            )}
 
             {!cameraActive && (
               <div className="space-y-3">
@@ -256,7 +359,11 @@ export default function SelfiePage() {
                 {/* File upload fallback */}
                 <div className="text-center">
                   <p className="text-sm text-gray-500 mb-2">
-                    {cameraError ? 'Upload a photo instead:' : 'Or upload one or more selfies:'}
+                    {cameraError
+                      ? 'Upload a photo instead:'
+                      : selfieMode === 'multi'
+                      ? 'Or select selfies in this order: front, right-side, left-side:'
+                        : 'Or upload one selfie:'}
                   </p>
                   <label className="cursor-pointer inline-block bg-gray-100 border border-gray-300 rounded-md px-4 py-2 text-sm hover:bg-gray-200">
                     Choose File
@@ -264,11 +371,35 @@ export default function SelfiePage() {
                       type="file"
                       accept="image/*"
                       capture="user"
-                      multiple
+                      multiple={selfieMode === 'multi'}
                       onChange={handleFileUpload}
                       className="hidden"
                     />
                   </label>
+                </div>
+              </div>
+            )}
+
+            {selfieMode === 'multi' && capturedImages.length > 0 && (
+              <div className="space-y-3">
+                <p className="text-sm text-gray-500">
+                  {capturedImages.length} angle{capturedImages.length === 1 ? '' : 's'} will be fused for matching.
+                  {capturedImages.length < 2 && ' Add one more angle to continue.'}
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    onClick={retake}
+                    className="flex-1 border border-gray-300 py-2 rounded-md hover:bg-gray-50"
+                  >
+                    Retake
+                  </button>
+                  <button
+                    onClick={submitSelfie}
+                    disabled={uploading || capturedImages.length < 2}
+                    className="flex-1 bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {uploading ? 'Matching...' : 'Find My Photos'}
+                  </button>
                 </div>
               </div>
             )}
@@ -277,11 +408,16 @@ export default function SelfiePage() {
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-2">
               {capturedImages.map((image, index) => (
-                <img key={image} src={image} alt={`Selfie ${index + 1}`} className="w-full rounded-lg" />
+                <div key={image}>
+                  <img src={image} alt={`${ANGLE_GUIDE[index]?.name || 'Selfie'} capture`} className="w-full rounded-lg" />
+                  <p className="mt-1 text-center text-xs text-gray-500">
+                    {ANGLE_GUIDE[index]?.name || `Selfie ${index + 1}`}
+                  </p>
+                </div>
               ))}
             </div>
             <p className="text-sm text-gray-500">
-              {capturedImages.length} selfie{capturedImages.length === 1 ? '' : 's'} will be fused for matching.
+              One selfie will be used for matching.
             </p>
             <div className="flex gap-3">
               <button

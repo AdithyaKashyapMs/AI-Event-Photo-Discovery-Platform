@@ -35,6 +35,33 @@ def get_selfie_face_app():
     return _selfie_face_app
 
 
+def fuse_selfie_embeddings(
+    embeddings: list[np.ndarray],
+    detection_scores: list[float],
+) -> tuple[np.ndarray, float]:
+    """Build a robust normalized template from one or more selfie embeddings."""
+    normalized = np.asarray(embeddings, dtype=float)
+    normalized /= np.maximum(
+        np.linalg.norm(normalized, axis=1, keepdims=True),
+        1e-12,
+    )
+    base_weights = np.maximum(np.asarray(detection_scores, dtype=float), 1e-6)
+
+    if len(normalized) == 1:
+        fused = normalized[0]
+        return fused, 1.0
+
+    similarities = normalized @ normalized.T
+    np.fill_diagonal(similarities, 0.0)
+    agreement = similarities.sum(axis=1) / (len(normalized) - 1)
+    # Keep every usable view, but reduce the influence of an inconsistent view.
+    consistency_weights = np.clip((agreement + 1.0) / 2.0, 0.1, 1.0)
+    weights = base_weights * consistency_weights
+    fused = np.average(normalized, axis=0, weights=weights)
+    fused /= max(float(np.linalg.norm(fused)), 1e-12)
+    return fused, float(np.average(agreement, weights=weights))
+
+
 # Create a new event (host only)
 @router.post("/")
 def create_event(
@@ -256,13 +283,7 @@ def match_selfie(
     if not embeddings:
         raise HTTPException(status_code=400, detail="No face detected in the supplied selfies")
 
-    weights_array = np.asarray(weights, dtype=float)
-    fused_embedding = np.average(
-        np.asarray(embeddings),
-        axis=0,
-        weights=np.maximum(weights_array, 1e-6),
-    )
-    fused_embedding /= max(float(np.linalg.norm(fused_embedding)), 1e-12)
+    fused_embedding, fusion_agreement = fuse_selfie_embeddings(embeddings, weights)
     query_embedding = fused_embedding.tolist()
 
     # Search Qdrant for matching face embeddings
@@ -271,13 +292,13 @@ def match_selfie(
 
     research_started = perf_counter()
     _, research_stats = hierarchical_query(
-        client, collection_name, query_embedding, limit=100, use_cache=False
+        client, collection_name, query_embedding, limit=500, use_cache=False
     )
     research_latency_ms = round((perf_counter() - research_started) * 1000, 2)
 
     project_started = perf_counter()
     results, search_stats = hierarchical_query(
-        client, collection_name, query_embedding, limit=100, use_cache=True
+        client, collection_name, query_embedding, limit=500, use_cache=True
     )
     project_latency_ms = round((perf_counter() - project_started) * 1000, 2)
     search_stats["latency_ms"] = project_latency_ms
@@ -286,8 +307,12 @@ def match_selfie(
     search_stats["reduction_percent"] = round(
         (1 - faces_considered / indexed_faces) * 100, 1
     ) if indexed_faces else 0
-    search_stats["similarity_threshold"] = 0.55
+    search_stats["similarity_threshold"] = 0.30
     search_stats["raw_results"] = len(results)
+    search_stats["fusion_method"] = (
+        "normalized detection-weighted robust template aggregation"
+    )
+    search_stats["fusion_agreement"] = round(fusion_agreement, 4)
 
     # Keep recognition confidence based on face similarity. Photo quality must not
     # turn a weak identity match into an accepted result.

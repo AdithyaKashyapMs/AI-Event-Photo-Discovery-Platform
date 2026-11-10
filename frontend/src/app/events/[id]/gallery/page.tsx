@@ -39,6 +39,8 @@ export default function GalleryPage() {
     unique: Number(searchParams.get('unique') || 0),
     best: Number(searchParams.get('best') || 0),
     average: Number(searchParams.get('average') || 0),
+    fusionAgreement: Number(searchParams.get('fusionAgreement') || 0),
+    fusionMethod: searchParams.get('fusionMethod') || '',
     noMatchReason: searchParams.get('noMatchReason') || '',
     researchLatency: Number(searchParams.get('researchLatency') || 0),
     researchCandidates: Number(searchParams.get('researchCandidates') || 0),
@@ -51,7 +53,7 @@ export default function GalleryPage() {
   const [photos, setPhotos] = useState<GalleryPhoto[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [minConfidence, setMinConfidence] = useState(0.5)
+  const [minConfidence, setMinConfidence] = useState(0.55)
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const [downloading, setDownloading] = useState(false)
 
@@ -145,7 +147,8 @@ export default function GalleryPage() {
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
             <MetricGroup title="Face processing">
               <Metric label="Selfies processed" value={metrics.selfies} />
-              <Metric label="Embedding fusion" value={`${metrics.selfies} weighted`} />
+              <Metric label="Embedding fusion" value={`${metrics.selfies} robust`} />
+              <Metric label="Angle agreement" value={`${Math.round(metrics.fusionAgreement * 100)}%`} />
               <Metric label="Similarity threshold" value={`${Math.round(metrics.threshold * 100)}%`} />
             </MetricGroup>
             <MetricGroup title="Index search">
@@ -210,13 +213,16 @@ export default function GalleryPage() {
           Minimum confidence: {Math.round(minConfidence * 100)}%
           <input
             type="range"
-            min="0"
+            min="0.3"
             max="1"
-            step="0.05"
+            step="0.01"
             value={minConfidence}
             onChange={(event) => setMinConfidence(Number(event.target.value))}
             className="ml-4 align-middle"
           />
+          <span className="ml-3 text-gray-400">
+            {visiblePhotos.length} of {photos.length} candidates
+          </span>
         </label>
 
         {error && <p className="bg-red-50 text-red-700 p-3 rounded mb-4">{error}</p>}

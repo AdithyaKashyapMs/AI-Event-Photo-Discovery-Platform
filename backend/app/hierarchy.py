@@ -7,7 +7,8 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 
 MAX_CANDIDATE_BRANCHES = 3
-MIN_FACE_SIMILARITY = 0.55
+MIN_FACE_SIMILARITY = 0.30
+RECALL_LIMIT = 500
 _hierarchy_cache: dict[str, tuple[int, list[Any], dict[str, list[Any]], int, int]] = {}
 
 
@@ -201,10 +202,25 @@ def hierarchical_query(
                 with_payload=True,
             ).points
         )
+
+    # The hierarchy is a fast first pass, but a person's poses and lighting can
+    # place their faces in different branches. Add a full-index recall pass so
+    # branch selection cannot hide valid matches from the gallery.
+    results.extend(
+        client.query_points(
+            collection_name=collection_name,
+            query=query_embedding,
+            score_threshold=MIN_FACE_SIMILARITY,
+            limit=max(limit, RECALL_LIMIT),
+            with_payload=True,
+        ).points
+    )
+    unique_results = {str(result.id): result for result in results}
+    results = list(unique_results.values())
     results.sort(key=lambda result: result.score, reverse=True)
     return results[:limit], {
         "branches_considered": len(selected_codes),
-        "faces_considered": sum(len(branches[code]) for code in selected_codes),
+        "faces_considered": len(points),
         "indexed_faces": len(points),
         "branching_factor": branching_factor,
         "max_depth": max_depth,
