@@ -1,20 +1,22 @@
-fastapi
+fastapi>=0.115
 uvicorn
-sqlmodel
-pydantic
+sqlmodel>=0.0.22
+pydantic>=2
 psycopg[binary]
 alembic
-celery
-redis
-insightface
+celery>=5.3
+# GETDEL (single-use liveness challenges) needs redis-py 4.2+ and Redis server 6.2+
+redis>=4.2
+# 2.1 adds the passive liveness (anti-spoofing) addon
+insightface>=2.1
 onnxruntime
-qdrant-client
+qdrant-client>=1.10
 python-jose[cryptography]
 bcrypt<5
 python-multipart
 boto3
 qrcode[pil]
-Pillow
+Pillow>=10
 imagehash
 numpy
 opencv-python-headless

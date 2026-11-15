@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 
-// Reusable sidebar for dashboard pages
+// Navigation for host pages: a pill column on desktop, a scrolling pill row on phones.
 interface SidebarLink {
   href: string;
   label: string;
@@ -17,22 +17,22 @@ export default function Sidebar({ links }: SidebarProps) {
   const pathname = usePathname();
 
   return (
-    <aside className="w-64 bg-gray-900 border-r border-gray-800 min-h-screen p-4">
-      <ul className="space-y-2">
-        {links.map((link) => (
-          <li key={link.href}>
-            <Link
-              href={link.href}
-              className={`block px-4 py-2 rounded-lg ${
-                pathname === link.href
-                  ? 'bg-blue-600 text-white'
-                  : 'text-gray-300 hover:bg-gray-800'
-              }`}
-            >
-              {link.label}
-            </Link>
-          </li>
-        ))}
+    <aside className="shrink-0 border-b-[2.5px] border-ink bg-sun-soft md:min-h-[calc(100vh-64px)] md:w-60 md:border-b-0 md:border-r-[2.5px]">
+      <ul className="flex gap-2 overflow-x-auto p-3 md:flex-col md:p-4">
+        {links.map((link) => {
+          const active = pathname === link.href;
+          return (
+            <li key={link.href} className="shrink-0">
+              <Link
+                href={link.href}
+                aria-current={active ? 'page' : undefined}
+                className={`btn btn-sm md:w-full md:justify-start ${active ? 'btn-primary' : 'btn-white'}`}
+              >
+                {link.label}
+              </Link>
+            </li>
+          );
+        })}
       </ul>
     </aside>
   );

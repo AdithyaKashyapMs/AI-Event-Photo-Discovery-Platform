@@ -3,7 +3,8 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { apiFetch, setToken } from '../../../lib/api';
+import { apiFetch, safeNextPath } from '../../../lib/api';
+import AuthShell from '@/components/AuthShell';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -18,62 +19,66 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      // POST to the backend login endpoint
-      const data = await apiFetch('/auth/login', {
+      await apiFetch('/auth/login', {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       });
-      // Store the JWT and redirect to dashboard
-      setToken(data.access_token);
-      router.push('/dashboard');
-    } catch (err: any) {
-      setError(err.message || 'Login failed');
+      // Return to the page that asked for a login, if any.
+      const next = safeNextPath(new URLSearchParams(window.location.search).get('next'));
+      router.push(next ?? '/dashboard');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Login failed');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4">
-      <div className="w-full max-w-md bg-gray-900 rounded-xl p-8 border border-gray-800">
-        <h1 className="text-2xl font-bold text-white mb-6">Welcome Back</h1>
-        {error && <p className="text-red-400 text-sm mb-4">{error}</p>}
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm text-gray-300 mb-1">Email</label>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white"
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-300 mb-1">Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-          >
-            {loading ? 'Logging in...' : 'Login'}
-          </button>
-        </form>
-        <p className="text-gray-400 text-sm mt-4 text-center">
-          Don't have an account?{' '}
-          <Link href="/auth/register" className="text-blue-400 hover:underline">
-            Sign up
-          </Link>
-        </p>
-      </div>
-    </div>
+    <AuthShell
+      block="block-sky"
+      pose="wave"
+      bubble="Hey, welcome back!"
+      tagline="Your photos are right where you left them."
+      title="Log in"
+      subtitle="Good to see you again."
+    >
+      {error && <p className="alert alert-error mb-4" role="alert">{error}</p>}
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <label htmlFor="login-email" className="label">Email</label>
+          <input
+            id="login-email"
+            type="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+            className="input"
+            placeholder="you@example.com"
+          />
+        </div>
+        <div>
+          <label htmlFor="login-password" className="label">Password</label>
+          <input
+            id="login-password"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            className="input"
+          />
+        </div>
+        <button type="submit" disabled={loading} className="btn btn-primary btn-block btn-lg">
+          {loading ? 'Logging in…' : 'Log in'}
+        </button>
+      </form>
+      <p className="mt-5 text-center font-semibold text-ink-soft">
+        New here?{' '}
+        <Link href="/auth/register" className="font-extrabold text-tomato underline decoration-2 underline-offset-2">
+          Create an account
+        </Link>
+      </p>
+    </AuthShell>
   );
 }

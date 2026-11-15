@@ -3,13 +3,25 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { apiFetch, setToken } from '../../../lib/api';
+import { apiFetch } from '../../../lib/api';
+import AuthShell from '@/components/AuthShell';
+import Snappy from '@/components/Snappy';
+
+// Must match MIN_PASSWORD_LENGTH in backend/app/routers/auth.py
+const MIN_PASSWORD_LENGTH = 8;
+
+type Role = 'host' | 'attendee';
+
+const ROLE_OPTIONS: { value: Role; title: string; text: string }[] = [
+  { value: 'attendee', title: 'Find my photos', text: 'I was at an event' },
+  { value: 'host', title: 'Host an event', text: 'I upload the photos' },
+];
 
 export default function RegisterPage() {
   const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [role, setRole] = useState<'host' | 'attendee'>('attendee');
+  const [role, setRole] = useState<Role>('attendee');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -19,74 +31,97 @@ export default function RegisterPage() {
     setLoading(true);
 
     try {
-      // POST to the backend registration endpoint
-      const data = await apiFetch('/auth/register', {
+      await apiFetch('/auth/register', {
         method: 'POST',
         body: JSON.stringify({ email, password, role }),
       });
-      // Store the JWT and redirect to dashboard
-      setToken(data.access_token);
       router.push('/dashboard');
-    } catch (err: any) {
-      setError(err.message || 'Registration failed');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Registration failed');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4">
-      <div className="w-full max-w-md bg-gray-900 rounded-xl p-8 border border-gray-800">
-        <h1 className="text-2xl font-bold text-white mb-6">Create Account</h1>
-        {error && <p className="text-red-400 text-sm mb-4">{error}</p>}
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm text-gray-300 mb-1">Email</label>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white"
-            />
+    <AuthShell
+      block={role === 'host' ? 'block-sky' : 'block-sun'}
+      pose={role === 'host' ? 'camera' : 'selfie'}
+      bubble={role === 'host' ? 'Say cheese, everyone!' : 'Let’s find you!'}
+      tagline={
+        role === 'host'
+          ? 'Upload once. Every guest gets their own photos.'
+          : 'One live selfie. Every photo you are in.'
+      }
+      title="Create your account"
+      subtitle="Takes about 20 seconds."
+    >
+      {error && <p className="alert alert-error mb-4" role="alert">{error}</p>}
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <fieldset>
+          <legend className="label">I want to…</legend>
+          <div className="grid grid-cols-2 gap-3">
+            {ROLE_OPTIONS.map((option) => (
+              <label
+                key={option.value}
+                className={`sticker-flat flex cursor-pointer items-center gap-2 p-2.5 transition-colors focus-within:outline focus-within:outline-[3px] focus-within:outline-sky ${
+                  role === option.value ? (option.value === 'host' ? 'bg-sky-soft' : 'bg-sun-soft') : 'bg-white'
+                } ${role === option.value ? 'shadow-[3px_3px_0_var(--ink)]' : ''}`}
+              >
+                <input
+                  type="radio"
+                  name="role"
+                  value={option.value}
+                  checked={role === option.value}
+                  onChange={() => setRole(option.value)}
+                  className="sr-only"
+                />
+                <Snappy pose={option.value === 'host' ? 'camera' : 'selfie'} size={38} bob={false} />
+                <span>
+                  <span className="block font-display font-extrabold leading-tight">{option.title}</span>
+                  <span className="block text-xs font-semibold text-ink-soft">{option.text}</span>
+                </span>
+              </label>
+            ))}
           </div>
-          <div>
-            <label className="block text-sm text-gray-300 mb-1">Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              minLength={6}
-              className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white"
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-300 mb-1">Role</label>
-            <select
-              value={role}
-              onChange={(e) => setRole(e.target.value as 'host' | 'attendee')}
-              className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white"
-            >
-              <option value="attendee">Attendee</option>
-              <option value="host">Host</option>
-            </select>
-          </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-          >
-            {loading ? 'Creating...' : 'Create Account'}
-          </button>
-        </form>
-        <p className="text-gray-400 text-sm mt-4 text-center">
-          Already have an account?{' '}
-          <Link href="/auth/login" className="text-blue-400 hover:underline">
-            Login
-          </Link>
-        </p>
-      </div>
-    </div>
+        </fieldset>
+        <div>
+          <label htmlFor="register-email" className="label">Email</label>
+          <input
+            id="register-email"
+            type="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+            className="input"
+            placeholder="you@example.com"
+          />
+        </div>
+        <div>
+          <label htmlFor="register-password" className="label">Password</label>
+          <input
+            id="register-password"
+            type="password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            minLength={MIN_PASSWORD_LENGTH}
+            className="input"
+          />
+          <p className="hint">At least {MIN_PASSWORD_LENGTH} characters.</p>
+        </div>
+        <button type="submit" disabled={loading} className="btn btn-primary btn-block btn-lg">
+          {loading ? 'Creating…' : 'Create account'}
+        </button>
+      </form>
+      <p className="mt-5 text-center font-semibold text-ink-soft">
+        Already have an account?{' '}
+        <Link href="/auth/login" className="font-extrabold text-tomato underline decoration-2 underline-offset-2">
+          Log in
+        </Link>
+      </p>
+    </AuthShell>
   );
 }

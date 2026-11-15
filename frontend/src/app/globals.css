@@ -1,19 +1,260 @@
 @import "tailwindcss";
 
+/*
+ * EventSnap look: flat, bold colour blocks with white round-headed mascots
+ * ("Snappies"), in the spirit of minimal Indian TV ads. Cards and buttons are
+ * "stickers": white, thick ink outline, solid offset shadow.
+ */
 :root {
-  --background: #030712;
-  --foreground: #ededed;
+  --paper: #fff8ec;
+  --ink: #1f1a17;
+  --ink-soft: #5b524c;
+  --line: #1f1a17;
+  --sun: #ffc93c;
+  --sun-soft: #fff1c7;
+  --tomato: #f2542d;
+  --tomato-soft: #ffe1d8;
+  --sky: #3fa7d6;
+  --sky-soft: #dff1fa;
+  --mint: #3fbf87;
+  --mint-soft: #ddf6ea;
+  --plum: #8f5bd8;
+  --plum-soft: #ede3fb;
+  --white: #ffffff;
+  --danger: #c7321b;
+  --shadow: 4px 4px 0 var(--line);
+  --shadow-lg: 6px 6px 0 var(--line);
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-sun: var(--sun);
+  --color-sun-soft: var(--sun-soft);
+  --color-tomato: var(--tomato);
+  --color-tomato-soft: var(--tomato-soft);
+  --color-sky: var(--sky);
+  --color-sky-soft: var(--sky-soft);
+  --color-mint: var(--mint);
+  --color-mint-soft: var(--mint-soft);
+  --color-plum: var(--plum);
+  --color-plum-soft: var(--plum-soft);
+  --font-display: var(--font-baloo), "Trebuchet MS", system-ui, sans-serif;
+  --font-sans: var(--font-nunito), system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+html {
+  background: var(--paper);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+::selection {
+  background: var(--sun);
+  color: var(--ink);
+}
+
+/* Component classes live in the components layer so Tailwind utilities
+   (for example `absolute` or `px-3`) can still override them. */
+@layer components {
+  /* ---------- Stickers (cards) ---------- */
+  .sticker {
+    background: var(--white);
+    border: 2.5px solid var(--line);
+    border-radius: 1.25rem;
+    box-shadow: var(--shadow);
+  }
+  .sticker-lg {
+    background: var(--white);
+    border: 3px solid var(--line);
+    border-radius: 1.75rem;
+    box-shadow: var(--shadow-lg);
+  }
+  .sticker-flat {
+    background: var(--white);
+    border: 2px solid var(--line);
+    border-radius: 1rem;
+  }
+
+  /* ---------- Buttons ---------- */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border: 2.5px solid var(--line);
+    border-radius: 999px;
+    padding: 0.6rem 1.25rem;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 1rem;
+    line-height: 1.2;
+    box-shadow: 3px 3px 0 var(--line);
+    transition: transform 0.08s ease, box-shadow 0.08s ease, background-color 0.15s ease;
+    cursor: pointer;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) {
+    transform: translate(-1px, -1px);
+    box-shadow: 4px 4px 0 var(--line);
+  }
+  .btn:active:not(:disabled) {
+    transform: translate(2px, 2px);
+    box-shadow: 1px 1px 0 var(--line);
+  }
+  .btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  .btn:focus-visible,
+  .input:focus-visible,
+  .tab:focus-visible {
+    outline: 3px solid var(--sky);
+    outline-offset: 2px;
+  }
+  .btn-primary { background: var(--tomato); color: var(--white); }
+  .btn-sun { background: var(--sun); color: var(--ink); }
+  .btn-sky { background: var(--sky); color: var(--white); }
+  .btn-mint { background: var(--mint); color: var(--white); }
+  .btn-white { background: var(--white); color: var(--ink); }
+  .btn-danger { background: var(--danger); color: var(--white); }
+  .btn-lg { padding: 0.85rem 1.75rem; font-size: 1.15rem; }
+  .btn-sm { padding: 0.35rem 0.85rem; font-size: 0.875rem; box-shadow: 2px 2px 0 var(--line); }
+  .btn-block { width: 100%; }
+
+  /* ---------- Forms ---------- */
+  .label {
+    display: block;
+    margin-bottom: 0.35rem;
+    font-weight: 800;
+    font-size: 0.9rem;
+    color: var(--ink);
+  }
+  .input {
+    width: 100%;
+    background: var(--white);
+    color: var(--ink);
+    border: 2.5px solid var(--line);
+    border-radius: 0.9rem;
+    padding: 0.65rem 0.9rem;
+    font-size: 1rem;
+    transition: box-shadow 0.12s ease;
+  }
+  .input::placeholder { color: #9b918a; }
+  .input:focus { box-shadow: 3px 3px 0 var(--sky); outline: none; }
+  .hint { margin-top: 0.3rem; font-size: 0.8rem; color: var(--ink-soft); }
+
+  /* ---------- Messages ---------- */
+  .alert {
+    border: 2.5px solid var(--line);
+    border-radius: 1rem;
+    padding: 0.75rem 1rem;
+    font-weight: 600;
+    font-size: 0.925rem;
+  }
+  .alert-error { background: var(--tomato-soft); color: #7a1e0b; }
+  .alert-ok { background: var(--mint-soft); color: #11583a; }
+  .alert-warn { background: var(--sun-soft); color: #6b4a00; }
+  .alert-info { background: var(--sky-soft); color: #0f4d6b; }
+
+  /* ---------- Tabs, pills, chips ---------- */
+  .tab {
+    border: 2.5px solid var(--line);
+    border-radius: 999px;
+    padding: 0.4rem 1rem;
+    font-family: var(--font-display);
+    font-weight: 700;
+    background: var(--white);
+    color: var(--ink);
+  }
+  .tab[aria-selected="true"] {
+    background: var(--ink);
+    color: var(--white);
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    border: 2px solid var(--line);
+    border-radius: 999px;
+    padding: 0.2rem 0.7rem;
+    font-size: 0.8rem;
+    font-weight: 800;
+    background: var(--white);
+  }
+
+  /* ---------- Colour blocks (ad-style backgrounds) ---------- */
+  .block-sun { background: var(--sun); }
+  .block-tomato { background: var(--tomato); color: var(--white); }
+  .block-sky { background: var(--sky); color: var(--white); }
+  .block-mint { background: var(--mint); color: var(--white); }
+  .block-plum { background: var(--plum); color: var(--white); }
+
+  /* Speech bubble used by mascots */
+  .bubble {
+    position: relative;
+    background: var(--white);
+    color: var(--ink);
+    border: 2.5px solid var(--line);
+    border-radius: 1.25rem;
+    padding: 0.6rem 0.95rem;
+    font-family: var(--font-display);
+    font-weight: 700;
+    box-shadow: 3px 3px 0 var(--line);
+  }
+  .bubble::after {
+    content: "";
+    position: absolute;
+    left: 1.5rem;
+    bottom: -11px;
+    width: 18px;
+    height: 18px;
+    background: var(--white);
+    border-right: 2.5px solid var(--line);
+    border-bottom: 2.5px solid var(--line);
+    transform: rotate(45deg);
+  }
+}
+
+/* ---------- Mascot animation ---------- */
+@keyframes snappy-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+@keyframes snappy-wave {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(-28deg); }
+}
+@keyframes snappy-blink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  95% { transform: scaleY(0.1); }
+}
+@keyframes snappy-flash {
+  0%, 85%, 100% { opacity: 1; }
+  90% { opacity: 0.35; }
+}
+@keyframes snappy-pop {
+  from { transform: scale(0.6); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.snappy-bob { animation: snappy-bob 3.2s ease-in-out infinite; }
+.snappy-wave-arm { transform-box: fill-box; transform-origin: 0% 100%; animation: snappy-wave 1.4s ease-in-out infinite; }
+.snappy-eye { transform-box: fill-box; transform-origin: center; animation: snappy-blink 4.5s infinite; }
+.snappy-tuft { animation: snappy-flash 3s infinite; }
+.pop-in { animation: snappy-pop 0.35s cubic-bezier(0.2, 1.4, 0.4, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .snappy-bob, .snappy-wave-arm, .snappy-eye, .snappy-tuft, .pop-in { animation: none; }
 }

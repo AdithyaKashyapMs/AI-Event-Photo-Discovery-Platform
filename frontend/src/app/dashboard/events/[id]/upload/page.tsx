@@ -1,204 +1,217 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
 import Sidebar from '@/components/Sidebar';
+import Snappy from '@/components/Snappy';
 
-// Track each file's upload state
-interface UploadFile {
+interface QueuedFile {
+  id: number;
   file: File;
-  progress: number;
   status: 'pending' | 'uploading' | 'done' | 'error';
   error?: string;
 }
 
+interface ProcessingStatus {
+  total: number;
+  processed: number;
+  done: number;
+  duplicate: number;
+  failed: number;
+  pending: number;
+  progress: number;
+}
+
+// Must match MAX_UPLOAD_BYTES in backend/app/routers/events.py
+const MAX_UPLOAD_MB = 30;
+const POLL_INTERVAL_MS = 3000;
+
 export default function UploadPage() {
   const params = useParams<{ id: string }>();
   const eventId = params.id;
-  const [files, setFiles] = useState<UploadFile[]>([]);
+  const [files, setFiles] = useState<QueuedFile[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [processingStatus, setProcessingStatus] = useState<{ processed: number; total: number } | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadedCount, setUploadedCount] = useState(0);
+  const [status, setStatus] = useState<ProcessingStatus | null>(null);
+  const nextId = useRef(0);
 
-  // Handle drag-and-drop events
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback(() => {
-    setDragging(false);
-  }, []);
-
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    // Filter to only image files
-    const dropped = Array.from(e.dataTransfer.files).filter((f) =>
-      f.type.startsWith('image/')
-    );
-    addFiles(dropped);
-  }, []);
-
-  // Add files to the upload queue
   function addFiles(newFiles: File[]) {
-    const uploadFiles: UploadFile[] = newFiles.map((file) => ({
-      file,
-      progress: 0,
-      status: 'pending',
-    }));
-    setFiles((prev) => [...prev, ...uploadFiles]);
+    const queued = newFiles
+      .filter((file) => file.type.startsWith('image/'))
+      .map((file): QueuedFile => {
+        const tooLarge = file.size > MAX_UPLOAD_MB * 1024 * 1024;
+        return {
+          id: nextId.current++,
+          file,
+          status: tooLarge ? 'error' : 'pending',
+          error: tooLarge ? `Larger than ${MAX_UPLOAD_MB} MB` : undefined,
+        };
+      });
+    setFiles((prev) => [...prev, ...queued]);
   }
 
-  // Upload all pending files sequentially
+  function updateFile(id: number, changes: Partial<QueuedFile>) {
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, ...changes } : f)));
+  }
+
+  // Upload pending files one at a time so each gets its own result.
   async function uploadAll() {
-    for (let i = 0; i < files.length; i++) {
-      if (files[i].status !== 'pending') continue;
-
-      // Mark file as uploading
-      setFiles((prev) =>
-        prev.map((f, idx) => (idx === i ? { ...f, status: 'uploading' } : f))
-      );
-
+    if (uploading) return;
+    setUploading(true);
+    const pending = files.filter((f) => f.status === 'pending');
+    for (const queued of pending) {
+      updateFile(queued.id, { status: 'uploading' });
       try {
         const formData = new FormData();
-        formData.append('files', files[i].file);
-        setFiles((prev) =>
-          prev.map((f, idx) => (idx === i ? { ...f, progress: 50 } : f))
-        );
-        await apiFetch(`/events/${eventId}/photos`, {
-          method: 'POST',
-          body: formData,
-        });
-
-        // Mark as complete
-        setFiles((prev) =>
-          prev.map((f, idx) =>
-            idx === i ? { ...f, status: 'done', progress: 100 } : f
-          )
-        );
+        formData.append('files', queued.file);
+        await apiFetch(`/events/${eventId}/photos`, { method: 'POST', body: formData });
+        updateFile(queued.id, { status: 'done' });
+        setUploadedCount((count) => count + 1);
       } catch (error) {
-        const message =
-          error instanceof Error ? error.message : 'Upload failed';
-        // Mark as failed
-        setFiles((prev) =>
-          prev.map((f, idx) =>
-            idx === i ? { ...f, status: 'error', error: message } : f
-          )
-        );
+        updateFile(queued.id, {
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Upload failed',
+        });
       }
     }
+    setUploading(false);
   }
 
-  // Poll processing status after uploads start
+  // Poll processing status after the first successful upload, until the
+  // worker has finished every queued photo.
   useEffect(() => {
-    if (!files.some((f) => f.status === 'done')) return;
-    async function fetchProcessingStatus() {
-      const data = await apiFetch(`/events/${eventId}/analytics`);
-      setProcessingStatus({
-        processed: Math.round(
-          data.total_photos * (data.processing_progress / 100),
-        ),
-        total: data.total_photos,
-      });
+    if (uploadedCount === 0) return;
+    let timer: number | undefined;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const data: ProcessingStatus = await apiFetch(`/events/${eventId}/processing-status`);
+        if (cancelled) return;
+        setStatus(data);
+        if (data.pending > 0) timer = window.setTimeout(poll, POLL_INTERVAL_MS);
+      } catch {
+        if (!cancelled) timer = window.setTimeout(poll, POLL_INTERVAL_MS);
+      }
     }
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [uploadedCount, eventId]);
 
-    fetchProcessingStatus();
-    const interval = setInterval(fetchProcessingStatus, 3000);
-    return () => clearInterval(interval);
-  }, [files, eventId]);
+  const pendingCount = files.filter((f) => f.status === 'pending').length;
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex min-h-[calc(100vh-64px)] flex-col md:flex-row">
       <Sidebar
         links={[
           { href: '/dashboard', label: 'Dashboard' },
           { href: `/dashboard/events/${eventId}`, label: 'Event Overview' },
           { href: `/dashboard/events/${eventId}/upload`, label: 'Upload Photos' },
+          { href: `/events/${eventId}/gallery`, label: 'All Photos' },
+          { href: `/dashboard/events/${eventId}/label`, label: 'Label Faces' },
         ]}
       />
-      <main className="flex-1 p-8">
-        <h1 className="text-2xl font-bold mb-6">Upload Photos</h1>
+      <div className="flex-1 px-4 py-8 sm:px-8">
+        <h1 className="font-display text-4xl font-extrabold">Upload photos</h1>
+        <p className="mt-1 font-semibold text-ink-soft">
+          Drop the whole shoot in. We find every face, skip duplicates, and keep the photos private.
+        </p>
 
-        {/* Drag-and-drop zone */}
         <div
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
-          className={`border-2 border-dashed rounded-lg p-12 text-center mb-6 ${
-            dragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300'
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            addFiles(Array.from(e.dataTransfer.files));
+          }}
+          className={`sticker-lg mt-6 flex flex-col items-center gap-3 border-dashed p-8 text-center transition-colors sm:p-10 ${
+            dragging ? 'bg-sky-soft' : 'bg-sun-soft'
           }`}
         >
-          <p className="text-gray-500 mb-2">Drag and drop photos here, or</p>
-          <label className="cursor-pointer bg-blue-600 text-white px-4 py-2 rounded-lg inline-block">
-            Browse Files
+          <Snappy pose="photo" size={130} />
+          <p className="font-display text-2xl font-extrabold">
+            {dragging ? 'Drop them! I’ve got them.' : 'Drag & drop photos here'}
+          </p>
+          <label className="btn btn-primary cursor-pointer">
+            Browse files
             <input
               type="file"
               multiple
-              accept="image/*"
+              accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff"
               className="hidden"
-              onChange={(e) => addFiles(Array.from(e.target.files || []))}
+              onChange={(e) => {
+                addFiles(Array.from(e.target.files || []));
+                // Allow choosing the same file again later.
+                e.target.value = '';
+              }}
             />
           </label>
+          <p className="text-sm font-semibold text-ink-soft">JPEG, PNG, WebP, BMP or TIFF, up to {MAX_UPLOAD_MB} MB each.</p>
         </div>
 
-        {/* File list with progress bars */}
+        {pendingCount > 0 && (
+          <button onClick={uploadAll} disabled={uploading} className="btn btn-primary btn-lg mt-6">
+            {uploading ? 'Uploading…' : `Upload all (${pendingCount} file${pendingCount === 1 ? '' : 's'})`}
+          </button>
+        )}
+
+        {status && (
+          <div className="sticker mt-6 flex max-w-3xl flex-col gap-4 p-5 sm:flex-row sm:items-center">
+            <Snappy pose={status.pending > 0 ? 'search' : 'celebrate'} size={90} className="shrink-0" />
+            <div className="flex-1">
+              <h2 className="font-display text-xl font-extrabold">
+                {status.pending > 0 ? 'Finding faces in your photos…' : 'All done! Guests can search now.'}
+              </h2>
+              <p className="mt-1 text-sm font-semibold text-ink-soft">
+                {status.processed} / {status.total} photos processed
+                {status.duplicate > 0 && ` · ${status.duplicate} duplicates skipped`}
+                {status.failed > 0 && ` · ${status.failed} failed`}
+              </p>
+              <div className="mt-3 h-5 w-full overflow-hidden rounded-full border-[2.5px] border-ink bg-white">
+                <div className="h-full bg-mint transition-all" style={{ width: `${status.progress}%` }} />
+              </div>
+            </div>
+          </div>
+        )}
+
         {files.length > 0 && (
-          <div className="space-y-3 mb-6">
-            {files.map((f, idx) => (
-              <div key={idx} className="flex items-center gap-4 border rounded-lg p-3">
-                <span className="flex-1 truncate text-sm">{f.file.name}</span>
-                <div className="w-48 bg-gray-200 rounded-full h-2">
-                  <div
-                    className="bg-blue-600 h-2 rounded-full transition-all"
-                    style={{ width: `${f.progress}%` }}
-                  />
-                </div>
+          <ul className="mt-6 max-w-3xl space-y-2">
+            {files.map((f) => (
+              <li key={f.id} className="sticker-flat flex items-center gap-3 px-4 py-2.5">
+                <span className="min-w-0 flex-1 truncate font-semibold">{f.file.name}</span>
                 <span
-                  className={`text-xs w-56 text-right ${
-                    f.status === 'error' ? 'text-red-600' : 'text-gray-500'
+                  className={`chip ${
+                    f.status === 'error'
+                      ? 'bg-tomato-soft'
+                      : f.status === 'done'
+                        ? 'bg-mint-soft'
+                        : f.status === 'uploading'
+                          ? 'bg-sky-soft'
+                          : ''
                   }`}
                   title={f.error}
                 >
                   {f.status === 'done'
-                    ? 'Done'
+                    ? 'Uploaded ✓'
                     : f.status === 'error'
                       ? f.error || 'Upload failed'
-                      : `${f.progress}%`}
+                      : f.status === 'uploading'
+                        ? 'Uploading…'
+                        : 'Waiting'}
                 </span>
-              </div>
+              </li>
             ))}
-          </div>
+          </ul>
         )}
-
-        {/* Upload button */}
-        {files.some((f) => f.status === 'pending') && (
-          <button
-            onClick={uploadAll}
-            className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 mb-6"
-          >
-            Upload All ({files.filter((f) => f.status === 'pending').length} files)
-          </button>
-        )}
-
-        {/* Real-time processing status */}
-        {processingStatus && (
-          <div className="mt-6 border rounded-lg p-4">
-            <h2 className="font-medium mb-2">Processing Status</h2>
-            <p className="text-sm text-gray-600 mb-2">
-              {processingStatus.processed} / {processingStatus.total} photos processed
-            </p>
-            <div className="w-full bg-gray-200 rounded-full h-3">
-              <div
-                className="bg-green-500 h-3 rounded-full transition-all"
-                style={{
-                  width: `${processingStatus.total > 0 ? (processingStatus.processed / processingStatus.total) * 100 : 0}%`,
-                }}
-              />
-            </div>
-          </div>
-        )}
-      </main>
+      </div>
     </div>
   );
 }

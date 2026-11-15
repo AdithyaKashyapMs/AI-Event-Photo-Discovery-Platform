@@ -1,28 +1,34 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import os
-from app.routers import auth, events, photos, users
+
+from app.config import CORS_ORIGINS, UPLOAD_DIR
 from app.database import create_db_and_tables
+from app.routers import auth, events, invites, labels, photos, users
 
-app = FastAPI(title='Event Photo Discovery API')
 
-
-@app.on_event('startup')
-def initialize_database():
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     create_db_and_tables()
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    yield
 
+
+app = FastAPI(title='Event Photo Discovery API', lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000'],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=['*'],
     allow_headers=['*'],
 )
-os.makedirs('uploads', exist_ok=True)
-app.mount('/uploads', StaticFiles(directory='uploads'), name='uploads')
-app.include_router(auth.router, prefix='/auth')
-app.include_router(events.router, prefix='/events')
-app.include_router(photos.router, prefix='/photos')
-app.include_router(users.router, prefix="/users")
+
+# Photos are never served as static files; see GET /photos/{photo_id}/file.
+app.include_router(auth.router, prefix='/auth', tags=['auth'])
+app.include_router(events.router, prefix='/events', tags=['events'])
+app.include_router(labels.router, prefix='/events', tags=['labelling'])
+app.include_router(invites.router, prefix='/invites', tags=['invites'])
+app.include_router(photos.router, prefix='/photos', tags=['photos'])
+app.include_router(users.router, prefix='/users', tags=['users'])

@@ -2,443 +2,508 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { API_BASE } from '@/lib/api'
+import type { FaceLandmarker } from '@mediapipe/tasks-vision'
+import { API_BASE, errorMessage, hasSession, redirectToLogin } from '@/lib/api'
+import PrivacyNotice from '@/components/PrivacyNotice'
+import Snappy, { type SnappyPose } from '@/components/Snappy'
+import {
+  HOLD_MS,
+  STEP_LABELS,
+  assessFace,
+  poseProgress,
+  stepProgress,
+  type LivenessStep,
+} from '@/lib/liveness'
 
-type SelfieMode = 'single' | 'multi'
+type Phase = 'loading' | 'ready' | 'starting' | 'running' | 'verifying' | 'failed'
 
-const ANGLE_GUIDE = [
-  {
-    name: 'Front view',
-    instruction: 'Look straight at the camera with your face fully visible.',
-  },
-  {
-    name: 'Right-side view',
-    instruction: 'Turn your face slightly to your right. Keep one eye and most of your face visible.',
-  },
-  {
-    name: 'Left-side view',
-    instruction: 'Turn your face slightly to your left. Keep one eye and most of your face visible.',
-  },
-] as const
+type Challenge = { challenge_id: string; steps: LivenessStep[]; expires_in: number }
 
-// Selfie capture page with camera access and file upload fallback
+// Keep in sync with the installed @mediapipe/tasks-vision version.
+const MEDIAPIPE_WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm'
+const FACE_MODEL_URL = '/models/face_landmarker.task'
+// Finish well before the server-side challenge expires.
+const CHALLENGE_SAFETY_MARGIN_S = 15
+
+// MediaPipe's WebAssembly runtime writes its routine info and warning logs
+// (for example "INFO: Created TensorFlow Lite XNNPACK delegate for CPU") to
+// console.error, which the Next.js dev overlay reports as errors. Send those
+// glog-style lines to console.debug; real errors (E-prefixed) still reach
+// console.error.
+let mediaPipeLogFilterInstalled = false
+function routeMediaPipeInfoLogsToDebug() {
+  if (mediaPipeLogFilterInstalled) return
+  mediaPipeLogFilterInstalled = true
+  const originalError = console.error.bind(console)
+  console.error = (...args: unknown[]) => {
+    const first = args[0]
+    if (typeof first === 'string' && /^(INFO: |[IW]\d{4} \d\d:\d\d:\d\d)/.test(first)) {
+      console.debug(...args)
+      return
+    }
+    originalError(...args)
+  }
+}
+// MediaPipe binds console.error when a tracker is created, so install the
+// filter as soon as this page's code loads, before any tracker exists.
+if (typeof window !== 'undefined') routeMediaPipeInfoLogsToDebug()
+
+// One shared face tracker for the whole app. React's development mode mounts
+// the page twice, and closing a freshly loaded tracker on the first unmount
+// just to load another one is slow and noisy, so it is loaded once and reused.
+let faceLandmarkerPromise: Promise<FaceLandmarker> | null = null
+function getFaceLandmarker(): Promise<FaceLandmarker> {
+  faceLandmarkerPromise ??= loadFaceLandmarker().catch((error) => {
+    faceLandmarkerPromise = null
+    throw error
+  })
+  return faceLandmarkerPromise
+}
+
+async function loadFaceLandmarker(): Promise<FaceLandmarker> {
+  routeMediaPipeInfoLogsToDebug()
+  const { FaceLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision')
+  const fileset = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL)
+  const create = (delegate: 'GPU' | 'CPU') =>
+    FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate },
+      runningMode: 'VIDEO',
+      // Track two faces so a second person in view can be reported.
+      numFaces: 2,
+    })
+  try {
+    return await create('GPU')
+  } catch {
+    return await create('CPU')
+  }
+}
+
+// Selfie page: a live head-turn check guards the search, so a photo taken from
+// social media cannot be used to find someone else's photos.
 export default function SelfiePage() {
   const params = useParams<{ id: string }>()
   const router = useRouter()
   const eventId = params.id
 
-  // Camera and capture state
   const videoRef = useRef<HTMLVideoElement>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const startingRef = useRef(false)
-  const [cameraActive, setCameraActive] = useState(false)
-  const [cameraStarting, setCameraStarting] = useState(false)
-  const [capturedImages, setCapturedImages] = useState<string[]>([])
-  const [selfieMode, setSelfieMode] = useState<SelfieMode>('single')
-  const [uploading, setUploading] = useState(false)
+  const landmarkerRef = useRef<FaceLandmarker | null>(null)
+  const frameRequestRef = useRef<number | null>(null)
+
+  // Per-challenge tracking state, kept in refs so the 30–60 fps loop does not
+  // re-render the page on every frame.
+  const challengeRef = useRef<Challenge | null>(null)
+  const stepIndexRef = useRef(0)
+  const holdStartRef = useRef<number | null>(null)
+  const capturesRef = useRef<Promise<Blob>[]>([])
+  const deadlineRef = useRef(0)
+  const lastVideoTimeRef = useRef(-1)
+  const lastTimestampRef = useRef(0)
+
+  const [phase, setPhase] = useState<Phase>('loading')
+  const [loadingMessage, setLoadingMessage] = useState('Starting camera…')
+  const [steps, setSteps] = useState<LivenessStep[]>([])
+  const [stepIndex, setStepIndex] = useState(0)
+  const [percent, setPercent] = useState(0)
+  const [hint, setHint] = useState('')
+  const [faceOk, setFaceOk] = useState(false)
   const [error, setError] = useState('')
-  const [cameraError, setCameraError] = useState(false)
+  const [fatal, setFatal] = useState(false)
 
-  // Get auth token from cookie
-  const getToken = () => {
-    const match = document.cookie.match(/token=([^;]+)/)
-    return match ? match[1] : ''
-  }
+  const stopLoop = useCallback(() => {
+    if (frameRequestRef.current !== null) {
+      cancelAnimationFrame(frameRequestRef.current)
+      frameRequestRef.current = null
+    }
+  }, [])
 
-  // Start the camera stream using getUserMedia
-  const startCamera = useCallback(async () => {
-    if (startingRef.current || streamRef.current) return
-    startingRef.current = true
-    setCameraStarting(true)
-    setError('')
-    try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
+  const stopCamera = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    if (videoRef.current) videoRef.current.srcObject = null
+  }, [])
+
+  // Start the camera and load the face tracker once.
+  useEffect(() => {
+    let disposed = false
+
+    const startCamera = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'user', width: { ideal: 640, max: 1280 }, height: { ideal: 480, max: 720 } },
-        audio: false
+        audio: false,
       })
-      const video = videoRef.current
-      if (!video) {
-        mediaStream.getTracks().forEach(track => track.stop())
+      if (disposed) {
+        stream.getTracks().forEach((track) => track.stop())
         return
       }
-      video.srcObject = mediaStream
+      streamRef.current = stream
+      const video = videoRef.current
+      if (!video) return
+      video.srcObject = stream
       await video.play()
-      streamRef.current = mediaStream
-      setCameraActive(true)
-      setCameraError(false)
-    } catch (err) {
-      // Camera not available, show file upload fallback
-      setCameraError(true)
-      setError('Camera access denied or unavailable. Use file upload instead.')
-    } finally {
-      startingRef.current = false
-      setCameraStarting(false)
     }
-  }, [])
 
-  useEffect(() => {
-    void startCamera()
+    const init = async () => {
+      if (!hasSession()) {
+        redirectToLogin()
+        return
+      }
+      try {
+        await startCamera()
+      } catch {
+        if (!disposed) {
+          setFatal(true)
+          setError(
+            'Camera access is required. A live camera check makes sure only you can search for your photos. ' +
+              'Allow camera access in your browser settings and reload the page.',
+          )
+        }
+        return
+      }
+      try {
+        if (!disposed) setLoadingMessage('Loading face tracker…')
+        const landmarker = await getFaceLandmarker()
+        if (disposed) return
+        landmarkerRef.current = landmarker
+        setPhase('ready')
+      } catch {
+        if (!disposed) {
+          setFatal(true)
+          setError('Could not load the face tracker. Check your internet connection and reload the page.')
+        }
+      }
+    }
+
+    void init()
     return () => {
-      const activeStream = streamRef.current
-      activeStream?.getTracks().forEach(track => track.stop())
-      streamRef.current = null
-      if (videoRef.current) videoRef.current.srcObject = null
+      disposed = true
+      stopLoop()
+      stopCamera()
+      // The shared tracker is kept for the next visit, not closed.
+      landmarkerRef.current = null
     }
-  }, [])
+  }, [stopCamera, stopLoop])
 
-  // Capture a still frame from the video stream
-  const capturePhoto = () => {
-    if (!videoRef.current || !canvasRef.current) return
-
+  // Capture the current video frame at full resolution (unmirrored).
+  const captureFrame = (): Promise<Blob> => {
     const video = videoRef.current
-    const canvas = canvasRef.current
-    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) {
-      setError('Camera is still starting. Please wait a moment and try again.')
-      return
-    }
-
+    const canvas = document.createElement('canvas')
+    if (!video) return Promise.reject(new Error('Camera is not available'))
     canvas.width = video.videoWidth
     canvas.height = video.videoHeight
-
-    // Draw the current video frame to the canvas
-    const ctx = canvas.getContext('2d')
-    if (ctx) {
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
-      if (dataUrl.length > 'data:image/jpeg;base64,'.length) {
-        setCapturedImages((images) =>
-          selfieMode === 'single' ? [dataUrl] : [...images, dataUrl],
-        )
-      } else {
-        setError('Could not capture an image. Please try again.')
-      }
-    }
-
-    // Keep the camera open for additional angles, then stop after the third.
-    if (selfieMode === 'single' || capturedImages.length >= 2) {
-      stopCamera()
-    }
-  }
-
-  const currentAngle = ANGLE_GUIDE[capturedImages.length]
-
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop())
-      streamRef.current = null
-      if (videoRef.current) videoRef.current.srcObject = null
-      setCameraActive(false)
-    }
-  }
-
-  // Handle file upload as fallback
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []).slice(
-      0,
-      selfieMode === 'multi' ? 3 : 1,
+    canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height)
+    return new Promise((resolve, reject) =>
+      canvas.toBlob(
+        (blob) => (blob && blob.size ? resolve(blob) : reject(new Error('Could not capture a frame'))),
+        'image/jpeg',
+        0.92,
+      ),
     )
-    if (!files.length) return
-    Promise.all(files.map((file) => new Promise<string>((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onloadend = () => resolve(reader.result as string)
-      reader.onerror = reject
-      reader.readAsDataURL(file)
-    }))).then(setCapturedImages).catch(() => setError('Could not read the selected selfies.'))
-    e.target.value = ''
   }
 
-  // Convert base64 data URL to a File object for upload
-  const dataUrlToFile = (dataUrl: string, filename: string): File => {
-    const arr = dataUrl.split(',')
-    const mime = arr[0].match(/:(.*?);/)?.[1] || 'image/jpeg'
-    const bstr = atob(arr[1])
-    let n = bstr.length
-    const u8arr = new Uint8Array(n)
-    while (n--) {
-      u8arr[n] = bstr.charCodeAt(n)
+  const failChallenge = useCallback(
+    (message: string) => {
+      stopLoop()
+      challengeRef.current = null
+      setPhase('failed')
+      setFaceOk(false)
+      setError(message)
+    },
+    [stopLoop],
+  )
+
+  // Send the captured frames; the server verifies liveness and then matches.
+  const submitFrames = async (challenge: Challenge) => {
+    setPhase('verifying')
+    setHint('')
+    try {
+      const blobs = await Promise.all(capturesRef.current)
+      const formData = new FormData()
+      blobs.forEach((blob, index) => formData.append('files', blob, `liveness-${index + 1}.jpg`))
+      formData.append('challenge_id', challenge.challenge_id)
+
+      const res = await fetch(`${API_BASE}/events/${eventId}/match-selfie`, {
+        method: 'POST',
+        credentials: 'include',
+        body: formData,
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(errorMessage(data, 'Failed to match selfie'))
+      }
+
+      stopCamera()
+      // Matched photos are saved on the server; the URL only carries what the
+      // gallery shows about this search.
+      const query = new URLSearchParams({
+        searched: '1',
+        total: String(data.total || 0),
+        floor: String(data.search?.candidate_floor || 0),
+        threshold: String(data.search?.similarity_threshold || 0),
+        noMatchReason: String(data.search?.no_match_reason || ''),
+        liveScore: String(data.liveness?.live_score || 0),
+      })
+      router.push(`/events/${eventId}/gallery?${query.toString()}`)
+    } catch (err) {
+      failChallenge(err instanceof Error ? err.message : 'Failed to match selfie')
     }
-    return new File([u8arr], filename, { type: mime })
   }
 
-  // Submit the selfie to the match endpoint
-  const submitSelfie = async () => {
-    if (!capturedImages.length) return
-    if (selfieMode === 'multi' && capturedImages.length < 2) {
-      setError('Capture or select at least two selfies from different angles.')
+  // Per-frame tracking loop: measure the head pose, update the running
+  // percentage and capture a frame once each pose has been held.
+  const trackFrame = () => {
+    frameRequestRef.current = requestAnimationFrame(trackFrame)
+    const video = videoRef.current
+    const landmarker = landmarkerRef.current
+    const challenge = challengeRef.current
+    if (!video || !landmarker || !challenge) return
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return
+    // Only analyse new video frames.
+    if (video.currentTime === lastVideoTimeRef.current) return
+    lastVideoTimeRef.current = video.currentTime
+
+    const now = performance.now()
+    if (now > deadlineRef.current) {
+      failChallenge('Time ran out. Please start the check again.')
       return
     }
-    setUploading(true)
-    setError('')
-    stopCamera()
+    // MediaPipe requires strictly increasing timestamps.
+    const timestamp = Math.max(now, lastTimestampRef.current + 1)
+    lastTimestampRef.current = timestamp
 
-    try {
-      const files = capturedImages.map((image, index) =>
-        dataUrlToFile(image, `selfie-${index + 1}.jpg`),
-      )
-      if (files.some((selfieFile) => !selfieFile.size)) {
-        throw new Error('One of the selfie images is empty. Please choose another image.')
+    const result = landmarker.detectForVideo(video, timestamp)
+    const assessment = assessFace(result.faceLandmarks, video.videoWidth, video.videoHeight)
+    const index = stepIndexRef.current
+    const step = challenge.steps[index]
+    const total = challenge.steps.length
+
+    let progress = 0
+    if (assessment.ok) {
+      const pose = poseProgress(step, assessment.ratio)
+      if (pose >= 1) {
+        holdStartRef.current ??= now
+      } else {
+        holdStartRef.current = null
       }
-      const formData = new FormData()
-      files.forEach((selfieFile) => formData.append('files', selfieFile))
+      const held = holdStartRef.current === null ? 0 : now - holdStartRef.current
+      progress = stepProgress(pose, held)
+      setFaceOk(true)
+      setHint(pose >= 1 ? 'Hold still…' : step === 'center' ? 'Face the camera directly' : 'Keep turning…')
 
-      // POST to the match-selfie endpoint
-      const res = await fetch(
-        `${API_BASE}/events/${eventId}/match-selfie`,
-        {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${getToken()}` },
-          body: formData
+      if (held >= HOLD_MS) {
+        capturesRef.current.push(captureFrame())
+        holdStartRef.current = null
+        const next = index + 1
+        stepIndexRef.current = next
+        setPercent(Math.round((next / total) * 100))
+        if (next >= total) {
+          stopLoop()
+          challengeRef.current = null
+          void submitFrames(challenge)
+          return
         }
-      )
-
-      if (!res.ok) {
-        const data = await res.json()
-        throw new Error(data.detail || 'Failed to match selfie')
+        setStepIndex(next)
+        return
       }
+    } else {
+      holdStartRef.current = null
+      setFaceOk(false)
+      setHint(assessment.message)
+    }
+    setPercent(Math.round(((index + progress) / total) * 100))
+  }
 
-      const data = await res.json()
-      const matchedPhotoIds = (data.matches || [])
-        .map((match: { photo_id: number }) => match.photo_id)
-        .join(',')
-      const matchedScores = (data.matches || [])
-        .map((match: { photo_id: number; confidence: number }) =>
-          `${match.photo_id}:${match.confidence}`,
-        )
-        .join(',')
-      const params = new URLSearchParams({
-        matches: matchedPhotoIds,
-        scores: matchedScores,
-        total: String(data.total || 0),
-        branches: String(data.search?.branches_considered || 0),
-        candidates: String(data.search?.faces_considered || 0),
-        indexed: String(data.search?.indexed_faces || 0),
-        reduction: String(data.search?.reduction_percent || 0),
-        latency: String(data.search?.latency_ms || 0),
-        threshold: String(data.search?.similarity_threshold || 0),
-        raw: String(data.search?.raw_results || 0),
-        unique: String(data.search?.unique_photos || 0),
-        best: String(data.search?.best_similarity || 0),
-        average: String(data.search?.average_similarity || 0),
-        fusionAgreement: String(data.search?.fusion_agreement || 0),
-        fusionMethod: String(data.search?.fusion_method || ''),
-        noMatchReason: String(data.search?.no_match_reason || ''),
-        researchLatency: String(data.search?.comparison?.research_hierarchy?.latency_ms || 0),
-        researchCandidates: String(data.search?.comparison?.research_hierarchy?.candidates || 0),
-        projectLatency: String(data.search?.comparison?.our_project?.latency_ms || 0),
-        projectCandidates: String(data.search?.comparison?.our_project?.candidates || 0),
-        selfies: String(data.selfies_processed || 1),
-        branching: String(data.search?.branching_factor || 0),
-        depth: String(data.search?.max_depth || 0),
+  const startCheck = async () => {
+    setError('')
+    setPhase('starting')
+    try {
+      const res = await fetch(`${API_BASE}/events/${eventId}/liveness/challenge`, {
+        method: 'POST',
+        credentials: 'include',
       })
-      router.push(`/events/${eventId}/gallery?${params.toString()}`)
-    } catch (err: any) {
-      setError(err.message)
-    } finally {
-      setUploading(false)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(errorMessage(data, 'Could not start the check'))
+      const challenge = data as Challenge
+
+      challengeRef.current = challenge
+      stepIndexRef.current = 0
+      holdStartRef.current = null
+      capturesRef.current = []
+      lastVideoTimeRef.current = -1
+      deadlineRef.current = performance.now() + (challenge.expires_in - CHALLENGE_SAFETY_MARGIN_S) * 1000
+      setSteps(challenge.steps)
+      setStepIndex(0)
+      setPercent(0)
+      setHint('')
+      setPhase('running')
+      stopLoop()
+      frameRequestRef.current = requestAnimationFrame(trackFrame)
+    } catch (err) {
+      failChallenge(err instanceof Error ? err.message : 'Could not start the check')
     }
   }
 
-  // Reset to retake the selfie
-  const retake = () => {
-    stopCamera()
-    setCapturedImages([])
-    setError('')
-    if (!cameraError) {
-      window.setTimeout(() => void startCamera(), 0)
-    }
-  }
+  const running = phase === 'running'
+  const currentStep = steps[stepIndex]
+  const ovalColor = running ? (faceOk ? 'border-mint' : 'border-sun') : 'border-white/80'
 
-  const selectMode = (mode: SelfieMode) => {
-    stopCamera()
-    setSelfieMode(mode)
-    setCapturedImages([])
-    setError('')
-    if (!cameraError) {
-      window.setTimeout(() => void startCamera(), 0)
-    }
-  }
+  // The coach mascot acts out what is happening.
+  const coach: { pose: SnappyPose; block: string; line: string } =
+    fatal || phase === 'failed'
+      ? { pose: 'sad', block: 'block-tomato', line: 'Oops! Let’s try that again.' }
+      : phase === 'verifying'
+        ? { pose: 'search', block: 'block-sky', line: 'Checking it’s really you… then finding your photos!' }
+        : running && currentStep
+          ? {
+              pose: 'selfie',
+              block: 'block-sun',
+              line: faceOk ? STEP_LABELS[currentStep].instruction : hint || 'Show me your face!',
+            }
+          : phase === 'loading'
+            ? { pose: 'camera', block: 'block-sky', line: 'Getting the camera ready…' }
+            : { pose: 'wave', block: 'block-sun', line: 'Ready? Look at the camera and press start!' }
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center px-4">
-      <div className="max-w-lg w-full bg-white rounded-lg shadow-md p-6">
-        <h1 className="text-2xl font-bold text-center mb-2">Find Your Photos</h1>
-        <p className="text-gray-600 text-center mb-6">
-          Take a selfie or upload a photo so we can find you in event photos.
+    <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+      <div className="mb-6">
+        <h1 className="font-display text-4xl font-extrabold">Find your photos</h1>
+        <p className="mt-1 font-semibold text-ink-soft">
+          A 10-second live check proves it&apos;s really you, then we find you in every event photo.
         </p>
+      </div>
 
-        <div className="mb-6 grid grid-cols-2 gap-3">
-          <button
-            type="button"
-            onClick={() => selectMode('single')}
-            className={`rounded-lg border p-3 text-left ${
-              selfieMode === 'single'
-                ? 'border-blue-600 bg-blue-50 text-blue-900'
-                : 'border-gray-300 text-gray-700'
-            }`}
-          >
-            <span className="block font-semibold">One selfie</span>
-            <span className="mt-1 block text-xs">Fast search with one face view</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => selectMode('multi')}
-            className={`rounded-lg border p-3 text-left ${
-              selfieMode === 'multi'
-                ? 'border-blue-600 bg-blue-50 text-blue-900'
-                : 'border-gray-300 text-gray-700'
-            }`}
-          >
-            <span className="block font-semibold">Multiple angles</span>
-            <span className="mt-1 block text-xs">Use 2–3 views for better matching</span>
-          </button>
+      {error && (
+        <div className="alert alert-error mb-5" role="alert">
+          {error}
         </div>
+      )}
 
-        {error && (
-          <div className="bg-red-50 text-red-700 p-3 rounded mb-4 text-sm">
-            {error}
-          </div>
-        )}
-
-        {/* Camera preview or captured image */}
-        {!capturedImages.length || selfieMode === 'multi' ? (
-          <div className="space-y-4">
-            <div className={`relative ${cameraActive ? '' : 'hidden'}`}>
+      <div className="grid items-start gap-6 lg:grid-cols-[1.5fr_1fr]">
+        {!fatal && (
+          <div className="sticker-lg overflow-hidden">
+            {/* Camera preview, mirrored like a mirror; captured frames are not mirrored. */}
+            <div className="relative aspect-[4/3] overflow-hidden border-b-[3px] border-ink bg-ink">
               <video
                 ref={videoRef}
                 autoPlay
                 playsInline
                 muted
-                className="w-full rounded-lg bg-black"
+                className="h-full w-full object-cover"
+                style={{ transform: 'scaleX(-1)' }}
               />
-              {cameraActive && (
-                <>
-                  <button
-                    onClick={capturePhoto}
-                    disabled={selfieMode === 'multi' && capturedImages.length >= 3}
-                    className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white rounded-full w-16 h-16 border-4 border-blue-600 hover:border-blue-700 disabled:opacity-50"
-                    aria-label="Capture photo"
-                  />
-                  {selfieMode === 'multi' && capturedImages.length > 0 && (
-                    <span className="absolute top-3 left-3 rounded bg-black/70 px-2 py-1 text-xs text-white">
-                      {capturedImages.length}/3 angles captured
-                    </span>
-                  )}
-                </>
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <div className={`h-[70%] w-[42%] rounded-[50%] border-[5px] border-dashed transition-colors ${ovalColor}`} />
+              </div>
+              {running && currentStep && (
+                <div className="absolute inset-x-0 top-3 flex justify-center px-3">
+                  <span className="chip pop-in bg-white px-4 py-1.5 text-base" key={stepIndex}>
+                    <span className="text-xl leading-none">{STEP_LABELS[currentStep].arrow}</span>
+                    {STEP_LABELS[currentStep].instruction}
+                  </span>
+                </div>
+              )}
+              {phase === 'loading' && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 font-display text-lg font-bold text-white">
+                  <Snappy pose="camera" size={90} />
+                  {loadingMessage}
+                </div>
               )}
             </div>
 
-            {capturedImages.length > 0 && (
-              <div className="grid grid-cols-3 gap-2">
-                {capturedImages.map((image, index) => (
-                  <img key={image} src={image} alt={`Selfie angle ${index + 1}`} className="w-full rounded-lg" />
-                ))}
-              </div>
-            )}
-
-            {selfieMode === 'multi' && currentAngle && (
-              <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
-                <p className="font-semibold">
-                  Next: {currentAngle.name}
-                </p>
-                <p className="mt-1">{currentAngle.instruction}</p>
-              </div>
-            )}
-
-            {!cameraActive && (
-              <div className="space-y-3">
-                {!cameraError && (
-                  <button
-                    onClick={startCamera}
-                    className="w-full bg-blue-600 text-white py-3 rounded-md hover:bg-blue-700"
+            <div className="space-y-4 p-5">
+              {/* Running percentage below the camera */}
+              {(running || phase === 'verifying') && (
+                <div aria-live="polite">
+                  <div className="mb-2 flex items-baseline justify-between">
+                    <span className="font-display text-lg font-extrabold">
+                      {phase === 'verifying' ? 'Verifying on the server…' : 'Liveness check'}
+                    </span>
+                    <span className="font-display text-4xl font-extrabold tabular-nums text-tomato">{percent}%</span>
+                  </div>
+                  <div
+                    className="h-7 w-full overflow-hidden rounded-full border-[2.5px] border-ink bg-white"
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={percent}
                   >
-                    {cameraStarting ? 'Starting camera...' : 'Open Camera'}
-                  </button>
-                )}
-
-                {/* File upload fallback */}
-                <div className="text-center">
-                  <p className="text-sm text-gray-500 mb-2">
-                    {cameraError
-                      ? 'Upload a photo instead:'
-                      : selfieMode === 'multi'
-                      ? 'Or select selfies in this order: front, right-side, left-side:'
-                        : 'Or upload one selfie:'}
-                  </p>
-                  <label className="cursor-pointer inline-block bg-gray-100 border border-gray-300 rounded-md px-4 py-2 text-sm hover:bg-gray-200">
-                    Choose File
-                    <input
-                      type="file"
-                      accept="image/*"
-                      capture="user"
-                      multiple={selfieMode === 'multi'}
-                      onChange={handleFileUpload}
-                      className="hidden"
+                    <div
+                      className={`h-full border-r-[2.5px] border-ink transition-[width] duration-150 ${
+                        phase === 'verifying' ? 'animate-pulse bg-mint' : 'bg-sun'
+                      }`}
+                      style={{ width: `${percent}%`, borderRightWidth: percent > 0 && percent < 100 ? undefined : 0 }}
                     />
-                  </label>
+                  </div>
+                  {running && hint && (
+                    <p className={`mt-2 text-sm font-bold ${faceOk ? 'text-ink-soft' : 'text-tomato'}`}>{hint}</p>
+                  )}
                 </div>
-              </div>
-            )}
+              )}
 
-            {selfieMode === 'multi' && capturedImages.length > 0 && (
-              <div className="space-y-3">
-                <p className="text-sm text-gray-500">
-                  {capturedImages.length} angle{capturedImages.length === 1 ? '' : 's'} will be fused for matching.
-                  {capturedImages.length < 2 && ' Add one more angle to continue.'}
-                </p>
-                <div className="flex gap-3">
+              {steps.length > 0 && (running || phase === 'verifying') && (
+                <ol className="grid grid-cols-4 gap-2 text-center text-xs">
+                  {steps.map((step, index) => {
+                    const done = index < stepIndex || phase === 'verifying'
+                    const active = index === stepIndex && running
+                    return (
+                      <li
+                        key={index}
+                        className={`rounded-xl border-[2.5px] border-ink px-1 py-2 font-extrabold ${
+                          done ? 'bg-mint text-white' : active ? 'bg-sun shadow-[3px_3px_0_var(--ink)]' : 'bg-white text-ink-soft'
+                        }`}
+                      >
+                        <span className="block text-lg leading-none">{done ? '✓' : STEP_LABELS[step].arrow}</span>
+                        <span className="mt-1 block">{STEP_LABELS[step].title}</span>
+                      </li>
+                    )
+                  })}
+                </ol>
+              )}
+
+              {(phase === 'ready' || phase === 'failed' || phase === 'starting' || phase === 'loading') && (
+                <div className="space-y-3">
                   <button
-                    onClick={retake}
-                    className="flex-1 border border-gray-300 py-2 rounded-md hover:bg-gray-50"
+                    onClick={startCheck}
+                    disabled={phase === 'starting' || phase === 'loading'}
+                    className="btn btn-primary btn-lg btn-block"
                   >
-                    Retake
+                    {phase === 'starting'
+                      ? 'Starting…'
+                      : phase === 'loading'
+                        ? 'Getting ready…'
+                        : phase === 'failed'
+                          ? 'Try again'
+                          : 'Start live check'}
                   </button>
-                  <button
-                    onClick={submitSelfie}
-                    disabled={uploading || capturedImages.length < 2}
-                    className="flex-1 bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
-                  >
-                    {uploading ? 'Matching...' : 'Find My Photos'}
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-2">
-              {capturedImages.map((image, index) => (
-                <div key={image}>
-                  <img src={image} alt={`${ANGLE_GUIDE[index]?.name || 'Selfie'} capture`} className="w-full rounded-lg" />
-                  <p className="mt-1 text-center text-xs text-gray-500">
-                    {ANGLE_GUIDE[index]?.name || `Selfie ${index + 1}`}
+                  <p className="text-center text-sm font-semibold text-ink-soft">
+                    Look straight, then turn your head when asked. All angles are combined to match you in more
+                    poses.
                   </p>
                 </div>
-              ))}
-            </div>
-            <p className="text-sm text-gray-500">
-              One selfie will be used for matching.
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={retake}
-                className="flex-1 border border-gray-300 py-2 rounded-md hover:bg-gray-50"
-              >
-                Retake
-              </button>
-              <button
-                onClick={submitSelfie}
-                disabled={uploading}
-                className="flex-1 bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
-              >
-                {uploading ? 'Matching...' : 'Find My Photos'}
-              </button>
+              )}
             </div>
           </div>
         )}
 
-        {/* Hidden canvas for capturing video frames */}
-        <canvas ref={canvasRef} className="hidden" />
+        {/* Coach panel */}
+        <aside className="space-y-4">
+          <div className={`sticker-lg ${coach.block} flex flex-col items-center gap-3 p-6`}>
+            <div className="bubble pop-in self-stretch text-center" key={coach.line}>
+              {coach.line}
+            </div>
+            <Snappy pose={coach.pose} size={170} />
+          </div>
+          <div className="sticker p-4">
+            <h2 className="font-display text-lg font-extrabold">Tips for a quick check</h2>
+            <ul className="mt-2 space-y-1.5 text-sm font-semibold text-ink-soft">
+              <li>💡 Face a light; avoid a bright window behind you.</li>
+              <li>🙂 Keep your whole face inside the oval.</li>
+              <li>👤 Only you in the frame.</li>
+              <li>🐢 Turn slowly and hold each pose a moment.</li>
+            </ul>
+          </div>
+          <PrivacyNotice />
+        </aside>
       </div>
     </div>
   )

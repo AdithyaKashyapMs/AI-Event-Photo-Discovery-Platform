@@ -1,35 +1,102 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+import io
+import os
+import tempfile
+import threading
+import uuid
+import warnings
+import zipfile
+from time import perf_counter
+from typing import Optional
+
+import cv2
+import numpy as np
+import qrcode
+import redis
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlmodel import Session, select
-from app.models import Event, Photo, User, UserRole, FaceRecord, EventMembership
+from insightface.app import FaceAnalysis
+from PIL import Image
+from sqlmodel import Session, delete, func, select
+
+from app.access import (
+    is_event_host,
+    require_event_access,
+    require_event_host,
+    visible_photo_ids,
+)
+from app.config import (
+    FRONTEND_URL,
+    THUMBNAIL_DIR,
+    UPLOAD_DIR,
+    face_collection_name,
+    get_qdrant_client,
+)
+from app import ratelimit
 from app.database import get_session
 from app.deps import get_current_user, require_host
+from app.hierarchy import (
+    CANDIDATE_SIMILARITY_FLOOR,
+    MATCH_SIMILARITY_THRESHOLD,
+    hierarchical_query,
+    forget_cached_hierarchy,
+    scroll_all_points,
+)
+from app.liveness import (
+    LivenessError,
+    check_frame,
+    consume_challenge,
+    create_challenge,
+    liveness_required,
+    verify_frames,
+)
+from app.models import (
+    new_invite_token,
+    Event,
+    EventMembership,
+    FaceLabel,
+    FaceRecord,
+    Photo,
+    PhotoMatch,
+    User,
+    UserRole,
+)
 from app.tasks import process_photo
-from app.hierarchy import hierarchical_query
-from typing import Optional
-from insightface.app import FaceAnalysis
-from qdrant_client import QdrantClient
-import os
-import uuid
-import qrcode
-from io import BytesIO
-import numpy as np
-import cv2
-import io
-import zipfile
-import warnings
-from time import perf_counter
-
 
 router = APIRouter()
+
+MAX_EVENT_NAME_LENGTH = 200
+MAX_EVENT_DESCRIPTION_LENGTH = 2000
+
+# Uploads: stored under the format Pillow detects, not the client's file name.
+MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+UPLOAD_FORMATS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "BMP": ".bmp", "TIFF": ".tif"}
+
+MAX_SELFIE_FILES = 6
+MAX_SELFIE_BYTES = 8 * 1024 * 1024
+
+# Faces whose similarity to a cluster centroid reaches this join that cluster.
+CLUSTER_SIMILARITY_THRESHOLD = 0.6
+
 _selfie_face_app = None
+
+# Face recognition on selfies is CPU-heavy. FastAPI runs these requests in a
+# thread pool, so without a cap a burst of selfies would all run at once and
+# slow every request down. Extra requests wait briefly, then get a 503.
+SELFIE_MAX_CONCURRENT = max(1, int(os.getenv("SELFIE_MAX_CONCURRENT", "2")))
+SELFIE_QUEUE_WAIT_SECONDS = float(os.getenv("SELFIE_QUEUE_WAIT_SECONDS", "20"))
+_selfie_slots = threading.BoundedSemaphore(SELFIE_MAX_CONCURRENT)
 
 
 def get_selfie_face_app():
     global _selfie_face_app
     if _selfie_face_app is None:
+        # "observe" mode scores liveness on every face but still computes the
+        # embedding; app.liveness decides whether the selfie is accepted.
         _selfie_face_app = FaceAnalysis(
-            name="buffalo_l", providers=["CPUExecutionProvider"]
+            name="buffalo_l",
+            providers=["CPUExecutionProvider"],
+            addons=["liveness"],
+            liveness_mode="observe",
         )
         _selfie_face_app.prepare(ctx_id=0, det_size=(640, 640))
     return _selfie_face_app
@@ -48,8 +115,7 @@ def fuse_selfie_embeddings(
     base_weights = np.maximum(np.asarray(detection_scores, dtype=float), 1e-6)
 
     if len(normalized) == 1:
-        fused = normalized[0]
-        return fused, 1.0
+        return normalized[0], 1.0
 
     similarities = normalized @ normalized.T
     np.fill_diagonal(similarities, 0.0)
@@ -62,6 +128,37 @@ def fuse_selfie_embeddings(
     return fused, float(np.average(agreement, weights=weights))
 
 
+def parse_photo_ids(photo_ids: Optional[str]) -> Optional[set[int]]:
+    """Parse a comma-separated photo ID list from a query parameter."""
+    if photo_ids is None:
+        return None
+    try:
+        return {int(photo_id) for photo_id in photo_ids.split(",") if photo_id.strip()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid photo IDs") from exc
+
+
+def clean_event_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Event name is required")
+    if len(name) > MAX_EVENT_NAME_LENGTH:
+        raise HTTPException(status_code=400, detail="Event name is too long")
+    return name
+
+
+def clean_event_description(description: Optional[str]) -> Optional[str]:
+    if description is None:
+        return None
+    description = description.strip()
+    if len(description) > MAX_EVENT_DESCRIPTION_LENGTH:
+        raise HTTPException(status_code=400, detail="Event description is too long")
+    return description or None
+
+
+# --- Events ---
+
+
 # Create a new event (host only)
 @router.post("/")
 def create_event(
@@ -70,167 +167,302 @@ def create_event(
     user: User = Depends(require_host),
     session: Session = Depends(get_session),
 ):
-    event = Event(host_id=user.id, name=name, description=description)
+    event = Event(
+        host_id=user.id,
+        name=clean_event_name(name),
+        description=clean_event_description(description),
+    )
     session.add(event)
     session.commit()
     session.refresh(event)
-    return event
+    return event_payload(event, user)
 
 
-# List all events owned by the current host
+def event_payload(event: Event, user: User) -> dict:
+    """Event fields for the API. Only the host receives the invite token."""
+    host = is_event_host(event, user)
+    data = event.model_dump(exclude={"invite_token"})
+    data["is_host"] = host
+    if host:
+        data["invite_token"] = event.invite_token
+    return data
+
+
+# Hosts see the events they own; attendees see the events they joined.
 @router.get("/")
 def list_events(
     user: User = Depends(get_current_user), session: Session = Depends(get_session)
 ):
     if user.role == UserRole.host:
-        return session.exec(select(Event).where(Event.host_id == user.id)).all()
+        query = select(Event).where(Event.host_id == user.id)
+    else:
+        query = (
+            select(Event)
+            .join(EventMembership, EventMembership.event_id == Event.id)
+            .where(EventMembership.user_id == user.id)
+        )
+    events = session.exec(query.order_by(Event.created_at.desc())).all()
+    return [event_payload(event, user) for event in events]
 
-    return session.exec(
-        select(Event)
-        .join(EventMembership, EventMembership.event_id == Event.id)
-        .where(EventMembership.user_id == user.id)
-    ).all()
 
-
-# Get a single event by ID
 @router.get("/{event_id}")
 def get_event(
-    event_id: int,
     user: User = Depends(get_current_user),
+    event: Event = Depends(require_event_access),
+):
+    return event_payload(event, user)
+
+
+# Replace the invite token; links and QR codes already shared stop working.
+# Attendees who already joined keep their access.
+@router.post("/{event_id}/invite/reset")
+def reset_invite(
+    event: Event = Depends(require_event_host),
     session: Session = Depends(get_session),
 ):
-    event = session.get(Event, event_id)
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return event
-
-
-@router.get("/{event_id}/public")
-def get_public_event(event_id: int, session: Session = Depends(get_session)):
-    event = session.get(Event, event_id)
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return {"id": event.id, "name": event.name, "description": event.description}
-
-
-@router.post("/{event_id}/join")
-def join_event(
-    event_id: int,
-    user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    event = session.get(Event, event_id)
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    if user.role != UserRole.attendee:
-        raise HTTPException(status_code=403, detail="Attendee access required")
-
-    membership = session.exec(
-        select(EventMembership).where(
-            EventMembership.user_id == user.id,
-            EventMembership.event_id == event_id,
-        )
-    ).first()
-    if membership:
-        return membership
-
-    membership = EventMembership(user_id=user.id, event_id=event_id)
-    session.add(membership)
+    event.invite_token = new_invite_token()
+    session.add(event)
     session.commit()
-    session.refresh(membership)
-    return membership
+    session.refresh(event)
+    return {"invite_token": event.invite_token}
 
 
 # Update an event (host only, must own the event)
 @router.put("/{event_id}")
 def update_event(
-    event_id: int,
     name: Optional[str] = None,
     description: Optional[str] = None,
     user: User = Depends(require_host),
+    event: Event = Depends(require_event_host),
     session: Session = Depends(get_session),
 ):
-    event = session.get(Event, event_id)
-    if not event or event.host_id != user.id:
-        raise HTTPException(status_code=404, detail="Event not found")
-    if name:
-        event.name = name
-    if description:
-        event.description = description
+    if name is not None:
+        event.name = clean_event_name(name)
+    if description is not None:
+        # An empty description clears it.
+        event.description = clean_event_description(description)
+    session.add(event)
     session.commit()
     session.refresh(event)
-    return event
+    return event_payload(event, user)
 
 
-# Directory for local photo storage (S3 in production)
-UPLOAD_DIR = "uploads"
-
-
-# Bulk upload photos for an event
-@router.post("/{event_id}/photos")
-async def upload_photos(
+# Delete an event and everything derived from it (host only): photos and
+# thumbnails, the face embeddings of everyone in those photos, attendees'
+# saved matches and memberships.
+@router.delete("/{event_id}")
+def delete_event(
     event_id: int,
-    files: list[UploadFile] = File(...),
-    user: User = Depends(require_host),
+    event: Event = Depends(require_event_host),
     session: Session = Depends(get_session),
 ):
-    # Verify the event exists. require_host prevents attendee uploads.
-    event = session.get(Event, event_id)
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+    photos = session.exec(select(Photo).where(Photo.event_id == event_id)).all()
 
-    # Create the upload directory for this event
-    os.makedirs(f"{UPLOAD_DIR}/{event_id}", exist_ok=True)
+    client = get_qdrant_client()
+    collection_name = face_collection_name(event_id)
+    if client.collection_exists(collection_name):
+        client.delete_collection(collection_name)
+    forget_cached_hierarchy(collection_name)
+
+    for model in (PhotoMatch, FaceLabel, FaceRecord, EventMembership):
+        session.execute(delete(model).where(model.event_id == event_id))
+    session.execute(delete(Photo).where(Photo.event_id == event_id))
+    session.delete(event)
+    session.commit()
+
+    # Files last: if this fails, the database no longer references them.
+    for photo in photos:
+        (UPLOAD_DIR / photo.s3_key).unlink(missing_ok=True)
+        (THUMBNAIL_DIR / f"{photo.id}.jpg").unlink(missing_ok=True)
+    return {"deleted": True, "photos_deleted": len(photos)}
+
+
+# --- Photo upload and processing ---
+
+
+def _store_upload(event_id: int, upload: UploadFile) -> str:
+    """Save one uploaded image and return its storage key. Raises ValueError."""
+    event_dir = UPLOAD_DIR / str(event_id)
+    event_dir.mkdir(parents=True, exist_ok=True)
+    temporary = event_dir / f".upload-{uuid.uuid4()}"
+    try:
+        size = 0
+        with temporary.open("wb") as destination:
+            while chunk := upload.file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise ValueError(
+                        f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB"
+                    )
+                destination.write(chunk)
+        if size == 0:
+            raise ValueError("File is empty")
+
+        # Check the content, not the file name: it must be a readable image.
+        try:
+            with Image.open(temporary) as image:
+                image_format = image.format
+                image.verify()
+        except (OSError, Image.DecompressionBombError) as exc:
+            raise ValueError("Not a supported image file") from exc
+        extension = UPLOAD_FORMATS.get(image_format or "")
+        if extension is None:
+            raise ValueError(
+                "Unsupported image format. Use JPEG, PNG, WebP, BMP or TIFF."
+            )
+
+        s3_key = f"{event_id}/{uuid.uuid4()}{extension}"
+        temporary.replace(UPLOAD_DIR / s3_key)
+        return s3_key
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+# Bulk upload photos for an event (host only)
+@router.post("/{event_id}/photos")
+def upload_photos(
+    event_id: int,
+    files: list[UploadFile] = File(...),
+    event: Event = Depends(require_event_host),
+    session: Session = Depends(get_session),
+):
     photos = []
-
-    for file in files:
-        # Generate a unique filename preserving the original extension
-        ext = os.path.splitext(file.filename)[1]
-        s3_key = f"{event_id}/{uuid.uuid4()}{ext}"
-        file_path = os.path.join(UPLOAD_DIR, s3_key)
-
-        # Write file contents to local storage
-        content = await file.read()
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        # Create a Photo record with pending status
+    rejected = []
+    for upload in files:
+        try:
+            s3_key = _store_upload(event_id, upload)
+        except ValueError as exc:
+            rejected.append({"filename": upload.filename, "reason": str(exc)})
+            continue
+        finally:
+            upload.file.close()
         photo = Photo(event_id=event_id, s3_key=s3_key, status="pending")
         session.add(photo)
         photos.append(photo)
 
+    if not photos:
+        detail = rejected[0]["reason"] if len(rejected) == 1 else "No valid images were uploaded"
+        raise HTTPException(status_code=400, detail=detail)
+
     session.commit()
-    for p in photos:
-        session.refresh(p)
-        process_photo.delay(p.id)
+    for photo in photos:
+        session.refresh(photo)
+        process_photo.delay(photo.id)
 
-    return {"uploaded": len(photos), "photos": photos}
+    return {
+        "uploaded": len(photos),
+        "photos": [{"id": photo.id, "status": photo.status} for photo in photos],
+        "rejected": rejected,
+    }
 
 
-# Generate a QR code image for the event invite link
-@router.get("/{event_id}/qr")
-def generate_qr(
+# Lightweight processing counts, safe to poll every few seconds.
+@router.get("/{event_id}/processing-status")
+def get_processing_status(
     event_id: int,
-    user: User = Depends(require_host),
+    event: Event = Depends(require_event_host),
     session: Session = Depends(get_session),
 ):
-    event = session.get(Event, event_id)
-    if not event or event.host_id != user.id:
-        raise HTTPException(status_code=404, detail="Event not found")
+    rows = session.exec(
+        select(Photo.status, func.count(Photo.id))
+        .where(Photo.event_id == event_id)
+        .group_by(Photo.status)
+    ).all()
+    counts = {status: count for status, count in rows}
+    total = sum(counts.values())
+    finished = sum(counts.get(status, 0) for status in ("done", "duplicate", "failed"))
+    return {
+        "total": total,
+        "processed": finished,
+        "done": counts.get("done", 0),
+        "duplicate": counts.get("duplicate", 0),
+        "failed": counts.get("failed", 0),
+        "pending": counts.get("pending", 0) + counts.get("processing", 0),
+        "progress": round(finished / total * 100, 1) if total else 0,
+    }
 
-    # Build the invite URL and generate the QR code
-    invite_url = f"http://localhost:3000/events/{event_id}/join"
-    img = qrcode.make(invite_url)
 
-    # Save QR image to an in-memory buffer
-    buffer = BytesIO()
+# QR code image for the event invite link (host only)
+@router.get("/{event_id}/qr")
+def generate_qr(event: Event = Depends(require_event_host)):
+    img = qrcode.make(f"{FRONTEND_URL}/join/{event.invite_token}")
+    buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
-
     return StreamingResponse(buffer, media_type="image/png")
 
 
-# --- Selfie Matching ---
+# --- Selfie matching ---
+
+
+@router.post("/{event_id}/liveness/challenge")
+def start_liveness_challenge(
+    event_id: int,
+    current_user: User = Depends(get_current_user),
+    event: Event = Depends(require_event_access),
+):
+    """Issue a random, single-use head-turn challenge for the selfie camera."""
+    ratelimit.hit(ratelimit.LIVENESS_CHALLENGE_PER_USER, str(current_user.id))
+    try:
+        return create_challenge(current_user.id, event_id)
+    except redis.RedisError as exc:
+        raise HTTPException(
+            status_code=503, detail="Liveness service is unavailable. Please try again."
+        ) from exc
+
+
+def _read_selfie_faces(face_app, uploaded_file: UploadFile) -> list:
+    contents = uploaded_file.file.read(MAX_SELFIE_BYTES + 1)
+    if len(contents) > MAX_SELFIE_BYTES:
+        raise HTTPException(status_code=413, detail="Selfie image is too large")
+    if not contents:
+        return []
+    np_arr = np.frombuffer(contents, np.uint8)
+    try:
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    except cv2.error as exc:
+        raise HTTPException(status_code=400, detail="Invalid selfie image") from exc
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='`estimate` is deprecated since version 0.26.*',
+            category=FutureWarning,
+            module=r'insightface\.utils\.face_align',
+        )
+        return face_app.get(img)
+
+
+def _save_matches(
+    session: Session, user_id: int, event_id: int, matches: list[dict]
+) -> None:
+    """Replace the user's saved matches for this event with the new search."""
+    session.execute(
+        delete(PhotoMatch).where(
+            PhotoMatch.user_id == user_id, PhotoMatch.event_id == event_id
+        )
+    )
+    existing_photo_ids = set(
+        session.exec(
+            select(Photo.id).where(
+                Photo.event_id == event_id,
+                Photo.id.in_([match["photo_id"] for match in matches]),
+            )
+        ).all()
+    ) if matches else set()
+    for match in matches:
+        if match["photo_id"] in existing_photo_ids:
+            session.add(
+                PhotoMatch(
+                    user_id=user_id,
+                    event_id=event_id,
+                    photo_id=match["photo_id"],
+                    similarity=match["similarity"],
+                )
+            )
+    session.commit()
 
 
 @router.post("/{event_id}/match-selfie")
@@ -238,47 +470,92 @@ def match_selfie(
     event_id: int,
     files: list[UploadFile] | None = File(None),
     file: UploadFile | None = File(None),
+    challenge_id: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
+    event: Event = Depends(require_event_access),
+    session: Session = Depends(get_session),
 ):
     uploaded_files = list(files or [])
     if file is not None:
         uploaded_files.append(file)
-    if not uploaded_files:
-        raise HTTPException(status_code=400, detail="At least one selfie is required")
+    try:
+        ratelimit.hit(ratelimit.SELFIE_MATCH_PER_USER, str(current_user.id))
+        if not uploaded_files:
+            raise HTTPException(status_code=400, detail="At least one selfie is required")
+        if len(uploaded_files) > MAX_SELFIE_FILES:
+            raise HTTPException(status_code=400, detail="Too many selfie images")
+        if challenge_id is None and liveness_required():
+            raise HTTPException(
+                status_code=400,
+                detail="A live camera check is required to search for photos.",
+            )
 
-    face_app = get_selfie_face_app()
+        # Consume the challenge before any heavy work, so a failed attempt
+        # cannot be retried with the same challenge.
+        steps = None
+        if challenge_id is not None:
+            try:
+                steps = consume_challenge(challenge_id, current_user.id, event_id)
+            except LivenessError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except redis.RedisError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Liveness service is unavailable. Please try again.",
+                ) from exc
+            if len(uploaded_files) != len(steps):
+                raise HTTPException(
+                    status_code=422,
+                    detail="The liveness check is incomplete. Please try again.",
+                )
+
+        if not _selfie_slots.acquire(timeout=SELFIE_QUEUE_WAIT_SECONDS):
+            raise HTTPException(
+                status_code=503,
+                detail="Lots of people are searching right now. Please try again in a moment.",
+                headers={"Retry-After": "10"},
+            )
+        try:
+            face_app = get_selfie_face_app()
+            faces_per_file = [
+                _read_selfie_faces(face_app, uploaded_file) for uploaded_file in uploaded_files
+            ]
+        finally:
+            _selfie_slots.release()
+    finally:
+        # Selfie frames are processed in memory only and are never written to
+        # storage; their embeddings are discarded after this request.
+        for uploaded_file in uploaded_files:
+            uploaded_file.file.close()
+
     embeddings = []
     weights = []
-    try:
-        for uploaded_file in uploaded_files:
-            contents = uploaded_file.file.read()
-            if not contents:
-                continue
-            np_arr = np.frombuffer(contents, np.uint8)
-            try:
-                img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            except cv2.error as exc:
-                raise HTTPException(status_code=400, detail="Invalid selfie image") from exc
-            if img is None:
-                raise HTTPException(status_code=400, detail="Invalid image file")
-
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    'ignore',
-                    message='`estimate` is deprecated since version 0.26.*',
-                    category=FutureWarning,
-                    module=r'insightface\.utils\.face_align',
-                )
-                faces = face_app.get(img)
+    if steps is not None:
+        try:
+            frame_checks = [
+                check_frame(faces, step, number)
+                for number, (faces, step) in enumerate(zip(faces_per_file, steps), start=1)
+            ]
+            liveness_result = verify_frames(frame_checks)
+        except LivenessError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # Every verified frame is used: the straight-on and turned views are
+        # fused into one template, which matches more poses in event photos.
+        for frame in frame_checks:
+            embeddings.append(frame.embedding)
+            weights.append(frame.det_score)
+    else:
+        liveness_result = {
+            "passed": False,
+            "method": "not performed (LIVENESS_REQUIRED is disabled)",
+        }
+        for faces in faces_per_file:
+            faces = [face for face in faces if getattr(face, "embedding", None) is not None]
             if not faces:
                 continue
             face = max(faces, key=lambda detected: detected["det_score"])
             embeddings.append(np.asarray(face["embedding"], dtype=float))
             weights.append(float(face["det_score"]))
-    finally:
-        # Selfies are processed in memory only and are never written to storage.
-        for uploaded_file in uploaded_files:
-            uploaded_file.file.close()
 
     if not embeddings:
         raise HTTPException(status_code=400, detail="No face detected in the supplied selfies")
@@ -286,357 +563,331 @@ def match_selfie(
     fused_embedding, fusion_agreement = fuse_selfie_embeddings(embeddings, weights)
     query_embedding = fused_embedding.tolist()
 
-    # Search Qdrant for matching face embeddings
-    collection_name = f"event_{event_id}_faces"
-    client = QdrantClient(host="localhost", port=6333)
+    # Search the event's indexed faces. Benchmarks comparing search strategies
+    # live in backend/scripts/benchmark_search.py, not in user requests.
+    collection_name = face_collection_name(event_id)
+    client = get_qdrant_client()
+    started = perf_counter()
+    if client.collection_exists(collection_name):
+        results, search_stats = hierarchical_query(
+            client, collection_name, query_embedding, limit=500, use_cache=True
+        )
+        indexed_faces = search_stats["indexed_faces"]
+    else:
+        results, indexed_faces = [], 0
+    latency_ms = round((perf_counter() - started) * 1000, 1)
 
-    research_started = perf_counter()
-    _, research_stats = hierarchical_query(
-        client, collection_name, query_embedding, limit=500, use_cache=False
-    )
-    research_latency_ms = round((perf_counter() - research_started) * 1000, 2)
+    # Hosts can see every photo anyway, so they may explore candidates down to
+    # the floor. Attendees only get photos at or above the match threshold, so
+    # a weak match cannot expose someone else's photos.
+    host = is_event_host(event, current_user)
+    access_floor = CANDIDATE_SIMILARITY_FLOOR if host else MATCH_SIMILARITY_THRESHOLD
 
-    project_started = perf_counter()
-    results, search_stats = hierarchical_query(
-        client, collection_name, query_embedding, limit=500, use_cache=True
-    )
-    project_latency_ms = round((perf_counter() - project_started) * 1000, 2)
-    search_stats["latency_ms"] = project_latency_ms
-    indexed_faces = search_stats["indexed_faces"]
-    faces_considered = search_stats["faces_considered"]
-    search_stats["reduction_percent"] = round(
-        (1 - faces_considered / indexed_faces) * 100, 1
-    ) if indexed_faces else 0
-    search_stats["similarity_threshold"] = 0.30
-    search_stats["raw_results"] = len(results)
-    search_stats["fusion_method"] = (
-        "normalized detection-weighted robust template aggregation"
-    )
-    search_stats["fusion_agreement"] = round(fusion_agreement, 4)
-
-    # Keep recognition confidence based on face similarity. Photo quality must not
-    # turn a weak identity match into an accepted result.
-    seen_photos = {}
+    # Best face similarity per photo. Photo quality is not used, so a sharp
+    # photo cannot turn a weak identity match into an accepted result.
+    best_by_photo: dict[int, float] = {}
     for result in results:
         photo_id = result.payload["photo_id"]
-        quality = float(result.payload.get("quality_score", 0.5))
-        similarity = float(result.score)
-        candidate = {
-            "confidence": similarity,
-            "similarity": similarity,
-            "quality": quality,
-        }
-        if photo_id not in seen_photos or similarity > seen_photos[photo_id]["confidence"]:
-            seen_photos[photo_id] = candidate
-
-
-    matches = [
-        {"photo_id": pid, **scores} for pid, scores in seen_photos.items()
-    ]
-    matches.sort(key=lambda match: match["confidence"], reverse=True)
-    search_stats["unique_photos"] = len(matches)
-    search_stats["best_similarity"] = round(
-        matches[0]["similarity"], 4
-    ) if matches else 0
-    search_stats["average_similarity"] = round(
-        sum(match["similarity"] for match in matches) / len(matches), 4
-    ) if matches else 0
-    search_stats["no_match_reason"] = (
-        "No indexed face met the similarity threshold"
-        if not matches and indexed_faces
-        else "No faces are indexed for this event"
-        if not matches
-        else None
+        best_by_photo[photo_id] = max(best_by_photo.get(photo_id, 0.0), float(result.score))
+    candidates = sorted(
+        ({"photo_id": photo_id, "similarity": score} for photo_id, score in best_by_photo.items()),
+        key=lambda match: match["similarity"],
+        reverse=True,
     )
-    search_stats["comparison"] = {
-        "research_hierarchy": {
-            "method": "Hierarchy rebuilt from Qdrant on every request",
-            "latency_ms": research_latency_ms,
-            "candidates": research_stats["faces_considered"],
-        },
-        "our_project": {
-            "method": "Cached hierarchy with weighted fusion and filtering",
-            "latency_ms": project_latency_ms,
-            "candidates": faces_considered,
-        },
-        "improvements": [
-            "Hierarchy index reused between selfie requests",
-            "Weighted fusion of multiple selfie embeddings",
-            "Similarity threshold for rejecting weak matches",
-            "Photo-level deduplication",
-        ],
-        "accuracy_benchmark": "Unavailable without labeled ground-truth identities",
-    }
+    accepted_count = sum(
+        1 for match in candidates if match["similarity"] >= MATCH_SIMILARITY_THRESHOLD
+    )
+    visible_matches = [match for match in candidates if match["similarity"] >= access_floor]
+    _save_matches(session, current_user.id, event_id, visible_matches)
 
+    if accepted_count:
+        no_match_reason = None
+    elif indexed_faces:
+        no_match_reason = "None of the faces in this event's photos matched yours closely enough."
+    else:
+        no_match_reason = "No photos have been processed for this event yet. Try again later."
+
+    # "matches" holds the photos this user may now view (saved server-side);
+    # "total" counts those at or above the default match threshold.
     return {
-        "matches": matches,
-        "total": len(matches),
-        "selfies_processed": len(embeddings),
-        "search": search_stats,
+        "matches": visible_matches,
+        "total": accepted_count,
+        "frames_used": len(embeddings),
+        "liveness": liveness_result,
+        "search": {
+            "indexed_faces": indexed_faces,
+            "latency_ms": latency_ms,
+            "similarity_threshold": MATCH_SIMILARITY_THRESHOLD,
+            "candidate_floor": access_floor,
+            "fusion_agreement": round(fusion_agreement, 4),
+            "no_match_reason": no_match_reason,
+        },
         "privacy": {
-            "selfies_persisted": False,
-            "temporary_files_deleted": True,
+            "selfie_frames_stored": False,
+            "selfie_embedding_stored": False,
+            "stored": "the IDs and similarity scores of the photos you matched",
         },
     }
 
 
-# --- Gallery Endpoints ---
+# --- Gallery ---
+
+
+def _photo_payload(photo: Photo, similarity: Optional[float]) -> dict:
+    return {
+        "id": photo.id,
+        "url": f"/photos/{photo.id}/file",
+        "thumbnail_url": f"/photos/{photo.id}/file?variant=thumb",
+        "similarity": similarity,
+        "created_at": photo.created_at.isoformat(),
+    }
 
 
 @router.get("/{event_id}/gallery")
 def get_gallery(
     event_id: int,
-    min_confidence: float = 0.0,
-    sort_by: str = "date",
-    page: int = 1,
-    per_page: int = 20,
-    photo_ids: Optional[str] = None,
+    matched_only: bool = False,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=500),
     current_user: User = Depends(get_current_user),
+    event: Event = Depends(require_event_access),
     session: Session = Depends(get_session),
 ):
-    # Query photos for this event from the database
-    query = select(Photo).where(Photo.event_id == event_id, Photo.status == "done")
-    matched_photo_ids = None
-    if photo_ids is not None:
-        try:
-            matched_photo_ids = {
-                int(photo_id) for photo_id in photo_ids.split(",") if photo_id
-            }
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid photo IDs") from exc
-        query = query.where(Photo.id.in_(matched_photo_ids))
+    """Attendees see only their matched photos; hosts see the whole event.
 
-    # Apply sorting
-    if sort_by == "date":
-        query = query.order_by(Photo.created_at.desc())
-
-    # Apply pagination
+    A host can pass matched_only=true to see the results of their own selfie
+    search instead of every photo.
+    """
+    host = is_event_host(event, current_user)
     offset = (page - 1) * per_page
-    photos = session.exec(query.offset(offset).limit(per_page)).all()
-    total = session.exec(query).all()
+
+    if host and not matched_only:
+        base = select(Photo).where(Photo.event_id == event_id, Photo.status == "done")
+        total = session.exec(
+            select(func.count()).select_from(base.subquery())
+        ).one()
+        photos = session.exec(
+            base.order_by(Photo.created_at.desc(), Photo.id.desc())
+            .offset(offset)
+            .limit(per_page)
+        ).all()
+        scores = {
+            photo_id: similarity
+            for photo_id, similarity in session.exec(
+                select(PhotoMatch.photo_id, PhotoMatch.similarity).where(
+                    PhotoMatch.user_id == current_user.id,
+                    PhotoMatch.event_id == event_id,
+                )
+            ).all()
+        }
+        items = [_photo_payload(photo, scores.get(photo.id)) for photo in photos]
+        scope = "all"
+    else:
+        base = (
+            select(Photo, PhotoMatch.similarity)
+            .join(PhotoMatch, PhotoMatch.photo_id == Photo.id)
+            .where(
+                PhotoMatch.user_id == current_user.id,
+                PhotoMatch.event_id == event_id,
+                Photo.status == "done",
+            )
+        )
+        total = session.exec(
+            select(func.count()).select_from(base.subquery())
+        ).one()
+        rows = session.exec(
+            base.order_by(PhotoMatch.similarity.desc(), Photo.id)
+            .offset(offset)
+            .limit(per_page)
+        ).all()
+        items = [_photo_payload(photo, similarity) for photo, similarity in rows]
+        scope = "matched"
 
     return {
-        "photos": [
-            {"id": p.id, "s3_key": p.s3_key, "created_at": str(p.created_at)}
-            for p in photos
-        ],
+        "photos": items,
+        "scope": scope,
+        "is_host": host,
         "page": page,
         "per_page": per_page,
-        "total": len(total),
+        "total": total,
+        "similarity_threshold": MATCH_SIMILARITY_THRESHOLD,
     }
 
 
 @router.get("/{event_id}/gallery/download")
 def download_gallery(
     event_id: int,
+    photo_ids: Optional[str] = None,
     current_user: User = Depends(get_current_user),
+    event: Event = Depends(require_event_access),
     session: Session = Depends(get_session),
 ):
-    # Fetch all processed photos for this event
-    photos = session.exec(
-        select(Photo).where(Photo.event_id == event_id, Photo.status == "done")
-    ).all()
-
+    """ZIP of the requested photos, limited to the photos this user may see."""
+    query = select(Photo).where(Photo.event_id == event_id, Photo.status == "done")
+    requested_ids = parse_photo_ids(photo_ids)
+    if requested_ids is not None:
+        if not requested_ids:
+            raise HTTPException(status_code=400, detail="No photos selected for download")
+        query = query.where(Photo.id.in_(requested_ids))
+    allowed_ids = visible_photo_ids(session, event, current_user)
+    if allowed_ids is not None:
+        query = query.where(Photo.id.in_(allowed_ids))
+    photos = session.exec(query.order_by(Photo.id)).all()
     if not photos:
         raise HTTPException(status_code=404, detail="No photos available for download")
 
-    # Create an in-memory ZIP file
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+    # Build the archive in a temporary file (spilling to disk when large)
+    # rather than holding hundreds of photos in memory. JPEGs are already
+    # compressed, so they are stored without recompression.
+    archive = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
         for photo in photos:
-            # Read photo from storage (local or S3)
-            file_path = f"uploads/{photo.s3_key}"
-            try:
-                with open(file_path, "rb") as f:
-                    zf.writestr(photo.s3_key, f.read())
-            except FileNotFoundError:
-                continue
+            source = (UPLOAD_DIR / photo.s3_key).resolve()
+            if source.is_relative_to(UPLOAD_DIR) and source.is_file():
+                zf.write(source, arcname=f"photo_{photo.id}{source.suffix}")
+    archive.seek(0)
 
-    zip_buffer.seek(0)
+    def stream():
+        try:
+            while chunk := archive.read(1024 * 1024):
+                yield chunk
+        finally:
+            archive.close()
 
     return StreamingResponse(
-        zip_buffer,
+        stream(),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f"attachment; filename=event_{event_id}_photos.zip"
+            "Content-Disposition": f'attachment; filename="event_{event_id}_photos.zip"'
         },
     )
 
 
-@router.get('/{event_id}/clusters')
-async def get_event_clusters(event_id: int):
-    """Group all face embeddings for an event by person using centroid comparison."""
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import Filter, FieldCondition, MatchValue
-    import numpy as np
+# --- Host analytics ---
 
-    client = QdrantClient(url='http://localhost:6333')
-    collection_name = f'event_{event_id}_faces'
 
-    # Check if the collection exists before scrolling
-    if not client.collection_exists(collection_name):
-        return {'clusters': [], 'total_unique_people': 0}
-
-    # Scroll through all embeddings for this event
-    all_points = []
-    offset = None
-    while True:
-        points, next_offset = client.scroll(
-            collection_name=collection_name,
-            limit=100,
-            with_payload=True,
-            with_vectors=True,
-            offset=offset
-        )
-        all_points.extend(points)
-        if next_offset is None:
-            break
-        offset = next_offset
-
-    if not all_points:
-        return {'clusters': [], 'total_unique_people': 0}
-
-    # Incremental centroid comparison for clustering
-    similarity_threshold = 0.6
-    clusters = []  # Each cluster: {'centroid': np.array, 'embedding_ids': [], 'photo_ids': []}
-
-    for point in all_points:
-        vector = np.array(point.vector)
-        embedding_id = point.id
-        photo_id = point.payload.get('photo_id')
-
-        # Compare against existing cluster centroids
-        assigned = False
+def _cluster_faces(points: list) -> list[dict]:
+    """Group faces by person with incremental centroid comparison."""
+    clusters: list[dict] = []
+    for point in points:
+        vector = np.asarray(point.vector, dtype=float)
+        vector /= max(float(np.linalg.norm(vector)), 1e-12)
+        photo_id = point.payload.get("photo_id") if point.payload else None
         for cluster in clusters:
-            centroid = cluster['centroid']
-            # Cosine similarity between the face vector and cluster centroid
-            similarity = np.dot(vector, centroid) / (
-                np.linalg.norm(vector) * np.linalg.norm(centroid)
-            )
-            if similarity >= similarity_threshold:
-                # Add to this cluster and update centroid incrementally
-                cluster['embedding_ids'].append(str(embedding_id))
-                cluster['photo_ids'].append(photo_id)
-                n = len(cluster['embedding_ids'])
-                cluster['centroid'] = cluster['centroid'] + (vector - cluster['centroid']) / n
-                assigned = True
+            centroid = cluster["centroid"]
+            similarity = float(vector @ centroid) / max(float(np.linalg.norm(centroid)), 1e-12)
+            if similarity >= CLUSTER_SIMILARITY_THRESHOLD:
+                cluster["embedding_ids"].append(str(point.id))
+                cluster["photo_ids"].add(photo_id)
+                count = len(cluster["embedding_ids"])
+                cluster["centroid"] = centroid + (vector - centroid) / count
                 break
-
-        if not assigned:
-            # Create a new cluster for this face
+        else:
             clusters.append({
-                'centroid': vector,
-                'embedding_ids': [str(embedding_id)],
-                'photo_ids': [photo_id]
+                "centroid": vector,
+                "embedding_ids": [str(point.id)],
+                "photo_ids": {photo_id},
             })
+    return clusters
 
-    # Build response with representative embedding and photo count per cluster
-    cluster_results = []
-    for i, cluster in enumerate(clusters):
-        unique_photos = list(set(cluster['photo_ids']))
-        cluster_results.append({
-            'cluster_id': i,
-            'representative_embedding_id': cluster['embedding_ids'][0],
-            'photo_count': len(unique_photos),
-            'photo_ids': unique_photos
-        })
 
+def _event_clusters(event_id: int) -> list[dict]:
+    client = get_qdrant_client()
+    collection_name = face_collection_name(event_id)
+    if not client.collection_exists(collection_name):
+        return []
+    return _cluster_faces(scroll_all_points(client, collection_name))
+
+
+@router.get('/{event_id}/clusters')
+def get_event_clusters(
+    event_id: int,
+    event: Event = Depends(require_event_host),
+):
+    """Group all face embeddings for an event by person (host only)."""
+    clusters = _event_clusters(event_id)
     return {
-        'clusters': cluster_results,
-        'total_unique_people': len(clusters)
+        'clusters': [
+            {
+                'cluster_id': index,
+                'representative_embedding_id': cluster['embedding_ids'][0],
+                'photo_count': len(cluster['photo_ids']),
+                'photo_ids': sorted(pid for pid in cluster['photo_ids'] if pid is not None),
+            }
+            for index, cluster in enumerate(clusters)
+        ],
+        'total_unique_people': len(clusters),
     }
 
 
 @router.get('/{event_id}/analytics')
-async def get_event_analytics(event_id: int, session: Session = Depends(get_session)):
-    """Return comprehensive event analytics including clustering and quality data."""
-    from sqlmodel import select, func
-    from qdrant_client import QdrantClient
-    import numpy as np
+def get_event_analytics(
+    event_id: int,
+    event: Event = Depends(require_event_host),
+    session: Session = Depends(get_session),
+):
+    """Event analytics for the host: processing, faces, people and quality."""
+    status = get_processing_status(event_id, event, session)
 
-    # Total photos uploaded for this event
-    total_photos = session.exec(
-        select(func.count(Photo.id)).where(Photo.event_id == event_id)
+    faces_detected, average_quality, min_quality, max_quality = session.exec(
+        select(
+            func.count(FaceRecord.id),
+            func.avg(FaceRecord.quality_score),
+            func.min(FaceRecord.quality_score),
+            func.max(FaceRecord.quality_score),
+        ).where(FaceRecord.event_id == event_id)
     ).one()
-
-    # Processing progress: count photos by status
-    processed_count = session.exec(
-        select(func.count(Photo.id)).where(
-            Photo.event_id == event_id, Photo.status == 'done'
+    low_quality_faces = session.exec(
+        select(func.count(FaceRecord.id)).where(
+            FaceRecord.event_id == event_id, FaceRecord.quality_score < 0.5
         )
     ).one()
-    processing_progress = (processed_count / total_photos * 100) if total_photos > 0 else 0
 
-    # Total faces detected across all photos
-    faces_detected = session.exec(
-        select(func.count(FaceRecord.id)).where(FaceRecord.event_id == event_id)
+    total_attendees = session.exec(
+        select(func.count(EventMembership.id)).where(EventMembership.event_id == event_id)
+    ).one()
+    attendees_with_matches = session.exec(
+        select(func.count(func.distinct(PhotoMatch.user_id))).where(
+            PhotoMatch.event_id == event_id,
+            PhotoMatch.user_id != event.host_id,
+        )
     ).one()
 
-    # Unique people estimate from clustering
-    client = QdrantClient(url='http://localhost:6333')
-    collection_name = f'event_{event_id}_faces'
+    client = get_qdrant_client()
+    collection_name = face_collection_name(event_id)
+    hierarchy = {"branches": 0, "indexed_faces": 0}
     unique_people = 0
     if client.collection_exists(collection_name):
-        # Reuse the clustering logic to count unique people
-        clusters_response = await get_event_clusters(event_id)
-        unique_people = clusters_response['total_unique_people']
-
-    # Attendee engagement: count members for this event
-    memberships = session.exec(
-        select(EventMembership).where(EventMembership.event_id == event_id)
-    ).all()
-    attendee_engagement = {
-        'total_attendees': len(memberships),
-        'attendees_with_matches': 0
-    }
-
-    # Duplicate detection report
-    face_records = session.exec(
-        select(FaceRecord).where(FaceRecord.event_id == event_id)
-    ).all()
-    duplicate_count = 0
-    seen_embeddings = set()
-    for record in face_records:
-        if record.embedding_id in seen_embeddings:
-            duplicate_count += 1
-        seen_embeddings.add(record.embedding_id)
-
-    # Photo quality scoring summary
-    quality_scores = [r.quality_score for r in face_records if r.quality_score is not None]
-    quality_summary = {
-        'average_quality': float(np.mean(quality_scores)) if quality_scores else 0.0,
-        'min_quality': float(np.min(quality_scores)) if quality_scores else 0.0,
-        'max_quality': float(np.max(quality_scores)) if quality_scores else 0.0,
-        'low_quality_faces': len([q for q in quality_scores if q < 0.5])
-    }
-
-    hierarchy = {"branches": 0, "indexed_faces": faces_detected}
-    collection_name = f"event_{event_id}_faces"
-    if client.collection_exists(collection_name):
-        points, _ = client.scroll(
-            collection_name=collection_name,
-            limit=10000,
-            with_payload=True,
-            with_vectors=False,
-        )
+        points = scroll_all_points(client, collection_name)
         codes = {
             point.payload.get("identity_code")
             for point in points
             if point.payload and point.payload.get("identity_code")
         }
         hierarchy = {"branches": len(codes), "indexed_faces": len(points)}
+        unique_people = len(_cluster_faces(points))
 
     return {
-        'total_photos': total_photos,
+        'total_photos': status['total'],
         'faces_detected': faces_detected,
         'unique_people': unique_people,
-        'processing_progress': round(processing_progress, 1),
-        'attendee_engagement': attendee_engagement,
-        'duplicate_detection': {
-            'total_face_records': len(face_records),
-            'duplicate_embeddings': duplicate_count
+        'processing_progress': status['progress'],
+        'processing': status,
+        'attendee_engagement': {
+            'total_attendees': total_attendees,
+            'attendees_with_matches': attendees_with_matches,
         },
-        'quality_summary': quality_summary
-        ,
+        'duplicate_detection': {
+            'method': 'perceptual hash (pHash) per event',
+            'duplicate_photos': status['duplicate'],
+            'total_face_records': faces_detected,
+        },
+        'failed_photos': status['failed'],
+        'quality_summary': {
+            'average_quality': float(average_quality or 0.0),
+            'min_quality': float(min_quality or 0.0),
+            'max_quality': float(max_quality or 0.0),
+            'low_quality_faces': low_quality_faces,
+        },
         'hierarchy': hierarchy,
     }
