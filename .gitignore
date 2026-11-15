@@ -2,6 +2,7 @@
 backend/venv/
 backend/**/__pycache__/
 backend/uploads/
+uploads/
 *.py[cod]
 
 # Frontend dependencies and generated output
@@ -15,3 +16,9 @@ frontend/*.tsbuildinfo
 .env
 .env.*
 *.pdf
+
+# Benchmark output (regenerate with backend/scripts/benchmark_search.py)
+backend/benchmarks/results/
+
+# Test selfies for scripts/evaluate_matching.py (biometric data, never commit)
+backend/benchmarks/selfies/
